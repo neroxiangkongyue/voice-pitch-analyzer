@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.ogg
+.pixi/
+!pixi.toml
+!pixi.lock
