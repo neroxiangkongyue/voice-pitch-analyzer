@@ -1,0 +1,30 @@
+[workspace]
+name = "voice-pitch-analyzer"
+version = "0.1.0"
+description = "Voice pitch (F0) visualization tool with zoom, playback, and recording"
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[dependencies]
+python = ">=3.12,<3.14"
+ffmpeg = "*"
+pip = "*"
+
+[pypi-dependencies]
+pyside6 = "*"
+pyqtgraph = "*"
+librosa = "*"
+soundfile = "*"
+sounddevice = "*"
+numpy = "*"
+scipy = "*"
+
+[pypi-options]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+extra-index-urls = [
+    "https://mirrors.aliyun.com/pypi/simple/",
+    "https://pypi.douban.com/simple/",
+]
+
+[tasks]
+run = "python -m src.main"
