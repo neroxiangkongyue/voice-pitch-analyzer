@@ -23,6 +23,7 @@ class AudioPlayer:
         self._playing = False
         self._current_time = 0.0
         self._pos = 0
+        self._loop = False
 
     @property
     def is_playing(self) -> bool:
@@ -39,9 +40,11 @@ class AudioPlayer:
         sr: int,
         start: float = 0.0,
         end: float | None = None,
+        loop: bool = False,
     ) -> bool:
         """Play audio[start*sr : end*sr] (end=None plays to the end).
 
+        With loop=True the segment repeats until stop() is called.
         Stops any ongoing playback first; empty segments return False without
         touching audio hardware. Returns True when a stream was started.
         current_time is absolute on the audio timeline (start + elapsed).
@@ -56,6 +59,7 @@ class AudioPlayer:
             return False
 
         self._playing = True
+        self._loop = loop
         self._pos = 0
         self._current_time = start
 
@@ -63,15 +67,25 @@ class AudioPlayer:
             if not self._playing:
                 raise sd.CallbackStop
             i = self._pos
+            if i >= segment.size:  # segment exhausted
+                if self._loop:
+                    i = self._pos = 0
+                else:
+                    outdata[:] = 0
+                    raise sd.CallbackStop
             n = min(segment.size - i, frames)
-            if n <= 0:
-                outdata[:] = 0
-                raise sd.CallbackStop
             outdata[:n, 0] = segment[i:i + n]
-            outdata[n:] = 0
-            self._pos += n
+            self._pos = i + n
+            if self._loop and n < frames:
+                # Wrap around within this callback: fill the rest from the start.
+                n2 = min(segment.size, frames - n)
+                outdata[n:n + n2, 0] = segment[:n2]
+                self._pos = n2
+                outdata[n + n2:] = 0
+            else:
+                outdata[n:] = 0
             self._current_time = start + self._pos / sr
-            if n < frames:
+            if not self._loop and n < frames:
                 raise sd.CallbackStop
 
         try:

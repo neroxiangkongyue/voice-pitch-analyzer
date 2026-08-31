@@ -4,10 +4,12 @@ import math
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtWidgets import (
-    QGraphicsView, QGraphicsScene, QMenu, QGraphicsLineItem, QGraphicsPathItem,
+    QGraphicsView, QGraphicsScene, QMenu, QGraphicsLineItem, QGraphicsPathItem, QToolTip,
 )
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, Slot
-from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QCursor, QPolygonF, QPainterPath
+from PySide6.QtGui import (
+    QPainter, QPen, QColor, QBrush, QFont, QCursor, QPolygonF, QPainterPath,
+)
 
 pg.setConfigOption("background", "w")
 pg.setConfigOption("foreground", "k")
@@ -77,6 +79,8 @@ class PitchView(QGraphicsView):
         self._select_start_x = 0.0
         self._dragging_zoom = False
         self._zoom_start_x = 0.0
+        self._edge_drag: str | None = None  # "start" | "end" while adjusting
+        self._EDGE_PX = 6  # grab width of a selection edge
 
         self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         self.setMouseTracking(True)
@@ -329,9 +333,14 @@ class PitchView(QGraphicsView):
             self._zoom_start_x = event.position().x()
             self.viewport().setCursor(Qt.CursorShape.SizeHorCursor)
         elif event.button() == Qt.MouseButton.LeftButton:
-            self._selecting = True
-            self._select_start_x = event.position().x()
-            self._selection_rect.setRect(0, 0, 0, 0)
+            edge = self._edge_hit_test(event.position().x())
+            if edge:
+                self._edge_drag = edge
+                self.viewport().setCursor(Qt.CursorShape.SizeHorCursor)
+            else:
+                self._selecting = True
+                self._select_start_x = event.position().x()
+                self._selection_rect.setRect(0, 0, 0, 0)
         elif event.button() == Qt.MouseButton.RightButton:
             self._show_context_menu(event)
         super().mousePressEvent(event)
@@ -347,17 +356,39 @@ class PitchView(QGraphicsView):
                 self._parent._zoom_to_index(steps.index(nearest))
             return
 
+        if self._edge_drag:
+            t = self._time_at_px(event.position().x())
+            if self._edge_drag == "start":
+                self._selection_start = min(t, self._selection_end)
+            else:
+                self._selection_end = max(t, self._selection_start)
+            self._redraw()
+            return
+
         if self._selecting:
             vr = self._view_rect()
             x1 = self._select_start_x
             x2 = event.position().x()
             self._selection_rect.setRect(min(x1, x2), vr.top(), abs(x2 - x1), vr.height())
+        else:
+            # Resize cursor over draggable edges; pitch tooltip elsewhere.
+            if self._edge_hit_test(event.position().x()):
+                self.viewport().setCursor(Qt.CursorShape.SizeHorCursor)
+            elif self.viewport().cursor().shape() == Qt.CursorShape.SizeHorCursor:
+                self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            self._hover_info(event)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if self._dragging_zoom:
             self._dragging_zoom = False
             self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            return
+
+        if self._edge_drag:
+            self._edge_drag = None
+            self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+            self.selection_changed.emit(self._selection_start, self._selection_end)
             return
 
         if self._selecting and event.button() == Qt.MouseButton.LeftButton:
@@ -420,6 +451,16 @@ class PitchView(QGraphicsView):
         else:
             action = menu.addAction("播放选区")
         action.triggered.connect(self._play_selection)
+        if self._selection_end > self._selection_start:
+            loop_action = menu.addAction("循环播放选区")
+            loop_action.setCheckable(True)
+            loop_action.setChecked(
+                bool(self._parent is not None and getattr(self._parent, "_loop_enabled", False))
+            )
+            loop_action.triggered.connect(
+                lambda checked: self._parent._toggle_loop(checked)
+                if self._parent is not None else None
+            )
         menu.exec(QCursor.pos())
 
     @Slot()
@@ -436,6 +477,73 @@ class PitchView(QGraphicsView):
 
     def selection_end_time(self) -> float:
         return self._selection_end
+
+    def clear_selection(self):
+        """Remove any selection or single-click marker."""
+        if self._selection_start < 0 and self._selection_end < 0:
+            return
+        self._selection_start = -1.0
+        self._selection_end = -1.0
+        self._selection_rect.setRect(0, 0, 0, 0)
+        self.selection_changed.emit(-1.0, -1.0)
+
+    def nudge_selection(self, delta: float):
+        """Shift the selection (or marker) by delta seconds, clamped to the clip."""
+        if self._times is None or self._selection_start < 0:
+            return
+        d = self._duration
+        if self._selection_end > self._selection_start:
+            width = self._selection_end - self._selection_start
+            new_start = max(0.0, min(d - width, self._selection_start + delta))
+            self._selection_end = new_start + width
+            self._selection_start = new_start
+        else:
+            self._selection_start = self._selection_end = max(
+                0.0, min(d, self._selection_start + delta)
+            )
+        self._redraw()
+        self.selection_changed.emit(self._selection_start, self._selection_end)
+
+    def _edge_hit_test(self, px: float) -> str | None:
+        """Return 'start'/'end' if px is on a draggable selection edge."""
+        if self._selection_start < 0 or self._selection_end <= self._selection_start:
+            return None  # single-click markers have no adjustable edges
+        vr = self._view_rect()
+        x1 = self._time_to_x(self._selection_start)
+        x2 = self._time_to_x(self._selection_end)
+        if abs(px - x1) <= self._EDGE_PX:
+            return "start"
+        if abs(px - x2) <= self._EDGE_PX:
+            return "end"
+        return None
+
+    def _time_at_px(self, px: float) -> float:
+        vr = self._view_rect()
+        frac = max(0.0, min(1.0, (px - vr.left()) / vr.width()))
+        return max(0.0, min(self._duration, self._view_offset + frac * (self._duration / self._zoom)))
+
+    def _hover_info(self, event):
+        """Show time / frequency / note name tooltip while idling over the plot."""
+        if self._times is None or self._duration <= 0:
+            return
+        if self._selecting or self._dragging_zoom or self._edge_drag:
+            return
+        vr = self._view_rect()
+        px = event.position().x()
+        py = event.position().y()
+        if not (vr.left() <= px <= vr.right() and vr.top() <= py <= vr.bottom()):
+            return
+        t = self._time_at_px(px)
+        idx = int(np.searchsorted(self._times, t))
+        idx = min(idx, len(self._times) - 1)
+        f0 = float(self._f0[idx]) if self._f0 is not None and idx < len(self._f0) else float("nan")
+        conf = float(self._confidence[idx]) if self._confidence is not None and idx < len(self._confidence) else 0.0
+        if math.isfinite(f0) and conf > 0.05:
+            midi = round(_freq_to_midi(f0))
+            text = f"{t:.2f}s · {f0:.1f}Hz · {_note_name(midi)}"
+        else:
+            text = f"{t:.2f}s · 无声"
+        QToolTip.showText(event.globalPosition().toPoint(), text, self)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():

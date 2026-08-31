@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtCore import Qt, QTimer, Slot, QSize, QThread, QObject, Signal
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -104,6 +104,7 @@ class MainWindow(QMainWindow):
 
         self._current_zoom = 1.0
         self._zoom_steps = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
+        self._loop_enabled = False
 
         self._build_ui()
 
@@ -256,7 +257,29 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪")
 
     def _setup_shortcuts(self):
-        pass
+        QShortcut(QKeySequence(Qt.Key_Space), self, activated=self._on_toggle_play)
+        QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self._on_clear_selection)
+        QShortcut(QKeySequence(Qt.Key_Left), self, activated=lambda: self._pv.nudge_selection(-0.01))
+        QShortcut(QKeySequence(Qt.Key_Right), self, activated=lambda: self._pv.nudge_selection(0.01))
+        QShortcut(QKeySequence(Qt.Key_L), self, activated=lambda: self._toggle_loop())
+
+    @Slot()
+    def _on_clear_selection(self):
+        self._pv.clear_selection()
+
+    def _toggle_loop(self, checked: bool | None = None):
+        """Toggle loop playback of the current selection (L key / context menu)."""
+        if checked is None:
+            checked = not self._loop_enabled
+        self._loop_enabled = checked
+        self.statusBar().showMessage(
+            "循环播放: 开" if checked else "循环播放: 关", 2000
+        )
+        if checked and not self._player.is_playing:
+            s = self._pv.selection_start_time()
+            e = self._pv.selection_end_time()
+            if s >= 0 and e > s:
+                self._start_playback(s, e)
 
     # ── File Loading ──────────────────────────────────────────────
 
@@ -442,6 +465,7 @@ class MainWindow(QMainWindow):
                 self._doc.audio, self._doc.sr,
                 start=max(0.0, start),
                 end=end if end and end > 0 else None,
+                loop=self._loop_enabled,
             )
         except Exception as e:
             self._reset_play_ui()
