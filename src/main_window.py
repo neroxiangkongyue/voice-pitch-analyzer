@@ -1,16 +1,18 @@
 from __future__ import annotations
+import os
 import sys
+import threading
 from dataclasses import dataclass
 
 import numpy as np
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QAction, QKeySequence
-from PySide6.QtCore import Qt, QTimer, Slot, QSize
+from PySide6.QtCore import Qt, QTimer, Slot, QSize, QThread, QObject, Signal
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QSlider, QGroupBox, QStyleFactory,
     QMessageBox, QListWidget, QListWidgetItem, QSizePolicy,
-    QToolBar, QSplitter,
+    QToolBar, QSplitter, QProgressDialog,
 )
 
 from src.audio_loader import load_audio
@@ -38,6 +40,44 @@ class AudioDocument:
     path: str = ""
 
 
+class _LoadWorker(QObject):
+    """Loads audio and runs pitch analysis off the UI thread.
+
+    Emits progress / loaded / failed per file and finished when the whole
+    batch is done. Lives in a QThread owned by MainWindow.
+    """
+
+    progress = Signal(int, int, str)  # (current_index, total, display_name)
+    loaded = Signal(object)           # AudioDocument
+    failed = Signal(str, str)         # (path, error_message)
+    finished = Signal()
+
+    def __init__(self, paths: list[str]):
+        super().__init__()
+        self._paths = paths
+
+    @Slot()
+    def run(self):
+        total = len(self._paths)
+        for i, path in enumerate(self._paths, start=1):
+            if QThread.currentThread().isInterruptionRequested():
+                break
+            self.progress.emit(i, total, os.path.basename(path))
+            try:
+                audio, sr = load_audio(path)
+                times, f0, confidence = extract_pitch(audio, sr)
+                fmin, fmax = detect_frequency_range(f0, len(audio) / sr)
+                self.loaded.emit(AudioDocument(
+                    title=path, path=path,
+                    audio=audio, sr=sr,
+                    times=times, f0=f0, confidence=confidence,
+                    fmin=fmin, fmax=fmax,
+                ))
+            except Exception as e:
+                self.failed.emit(path, str(e))
+        self.finished.emit()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -55,10 +95,38 @@ class MainWindow(QMainWindow):
         self._play_timer = QTimer()
         self._play_timer.timeout.connect(self._on_play_tick)
 
+        # Async loading state.
+        self._loading = False
+        self._pending_paths: list[str] = []
+        self._load_thread: QThread | None = None
+        self._load_worker: _LoadWorker | None = None
+        self._load_dialog: QProgressDialog | None = None
+
         self._current_zoom = 1.0
         self._zoom_steps = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
 
         self._build_ui()
+
+        # Warm up the pitch-analysis pipeline (librosa/numba JIT) in the
+        # background so opening the first file is not slowed down by
+        # one-time compilation costs.
+        self._pitch_engine_warm = False
+        QTimer.singleShot(300, self._warmup_pitch_engine)
+
+    def _warmup_pitch_engine(self):
+        """Pre-compile librosa/numba kernels once, off the UI thread."""
+        if self._pitch_engine_warm:
+            return
+        self._pitch_engine_warm = True
+
+        def _run():
+            try:
+                silence = np.zeros(16000, dtype=np.float32)  # 1 s @ 16 kHz
+                extract_pitch(silence, 16000)
+            except Exception:
+                pass  # Warmup is best-effort only.
+
+        threading.Thread(target=_run, daemon=True, name="pitch-warmup").start()
 
     # ── UI Build ──────────────────────────────────────────────────
 
@@ -184,29 +252,105 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_open_file(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择音频文件", "", SUPPORTED_EXTS)
+        if paths:
+            self._load_files(paths)
+
+    def _load_files(self, paths: list[str]):
+        """Load a batch of paths; already-cached ones are just activated."""
+        new_paths: list[str] = []
         for p in paths:
-            self._load_file(p)
+            cached = next((d for d in self._docs if d.path == p), None)
+            if cached is not None:
+                self._activate_document(cached)
+            else:
+                new_paths.append(p)
+        if not new_paths:
+            return
+        if self._loading:
+            self._pending_paths.extend(new_paths)
+        else:
+            self._start_load_worker(new_paths)
 
     def _load_file(self, path: str):
-        # Reload of a known path just switches to its cached document.
-        for doc in self._docs:
-            if doc.path == path:
-                self._activate_document(doc)
-                return
-        self.statusBar().showMessage(f"正在加载: {path}")
-        QApplication.processEvents()
-        try:
-            audio, sr = load_audio(path)
-            times, f0, confidence = extract_pitch(audio, sr)
-            fmin, fmax = detect_frequency_range(f0, len(audio) / sr)
-            self._add_document(AudioDocument(
-                title=path, path=path, audio=audio, sr=sr,
-                times=times, f0=f0, confidence=confidence,
-                fmin=fmin, fmax=fmax,
-            ))
-        except Exception as e:
-            QMessageBox.critical(self, "加载失败", str(e))
-            self.statusBar().showMessage("加载失败")
+        self._load_files([path])
+
+    def _start_load_worker(self, paths: list[str]):
+        self._loading = True
+        self._load_thread = QThread(self)
+        self._load_worker = _LoadWorker(paths)
+        self._load_worker.moveToThread(self._load_thread)
+        self._load_thread.started.connect(self._load_worker.run)
+        self._load_worker.progress.connect(self._on_load_progress)
+        self._load_worker.loaded.connect(self._add_document)
+        self._load_worker.failed.connect(self._on_load_failed)
+        self._load_worker.finished.connect(self._on_load_finished)
+        self._load_thread.finished.connect(self._on_load_thread_finished)
+
+        total = len(paths)
+        dialog = QProgressDialog(self)
+        dialog.setWindowTitle("加载音频")
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.setCancelButtonText("取消")
+        dialog.setMinimumDuration(0)  # appear immediately, no 4s hidden delay
+        if total == 1:
+            # Indeterminate busy bar while a single file is analyzed.
+            dialog.setRange(0, 0)
+            dialog.setLabelText("正在加载音频并分析音高...")
+        else:
+            dialog.setRange(0, total)
+            dialog.setValue(0)
+            dialog.setLabelText("准备加载...")
+        dialog.canceled.connect(self._on_load_canceled)
+        dialog.show()
+        self._load_dialog = dialog
+
+        self.statusBar().showMessage(f"正在加载 {total} 个文件...")
+        self._load_thread.start()
+
+    @Slot(int, int, str)
+    def _on_load_progress(self, idx: int, total: int, name: str):
+        if self._load_dialog is None:
+            return
+        if total > 1:
+            self._load_dialog.setValue(idx)
+            self._load_dialog.setLabelText(f"正在加载 ({idx}/{total}): {name}")
+        else:
+            self._load_dialog.setLabelText(f"正在加载并分析音高: {name}")
+
+    @Slot()
+    def _on_load_canceled(self):
+        if self._load_dialog is not None:
+            self._load_dialog.setLabelText("正在取消...")
+        if self._load_thread is not None and self._load_thread.isRunning():
+            self._load_thread.requestInterruption()
+        self.statusBar().showMessage("已取消加载")
+
+    @Slot(str, str)
+    def _on_load_failed(self, path: str, msg: str):
+        QMessageBox.critical(self, "加载失败", f"{os.path.basename(path)}\n{msg}")
+
+    @Slot()
+    def _on_load_finished(self):
+        # Worker finished the batch (or was interrupted); stop the thread.
+        if self._load_dialog is not None:
+            self._load_dialog.close()
+            self._load_dialog = None
+        if self._load_thread is not None:
+            self._load_thread.quit()
+
+    @Slot()
+    def _on_load_thread_finished(self):
+        thread = self._load_thread
+        self._load_thread = None
+        self._load_worker = None  # dropped ref -> worker is GC'd (no parent)
+        if thread is not None:
+            thread.deleteLater()
+        if self._pending_paths:
+            paths, self._pending_paths = self._pending_paths, []
+            self._start_load_worker(paths)
+        else:
+            self._loading = False
+            self.statusBar().showMessage("加载完成")
 
     def _add_document(self, doc: AudioDocument):
         if self._placeholder_active:
@@ -280,11 +424,20 @@ class MainWindow(QMainWindow):
         """Play [start, end) of the active document; end<=0 plays everything."""
         if self._doc is None:
             return
-        self._player.play(
-            self._doc.audio, self._doc.sr,
-            start=max(0.0, start),
-            end=end if end and end > 0 else None,
-        )
+        try:
+            started = self._player.play(
+                self._doc.audio, self._doc.sr,
+                start=max(0.0, start),
+                end=end if end and end > 0 else None,
+            )
+        except Exception as e:
+            self._reset_play_ui()
+            QMessageBox.critical(self, "播放失败", f"无法播放音频:\n{e}")
+            return
+        if not started:
+            # Nothing to play (e.g. selection outside the clip); stay idle.
+            self._reset_play_ui()
+            return
         self._play_timer.start(30)
         self._play_btn.setText("停止")
 
@@ -304,6 +457,8 @@ class MainWindow(QMainWindow):
         if self._player.is_playing:
             t = self._player.current_time
             self._pv.set_playhead(t)
+            # Follow the playhead so it never leaves the visible window.
+            self._pv.ensure_visible(t)
             self._playback_pos.setText(f"{t:.3f}s")
         else:
             self._reset_play_ui()

@@ -1,4 +1,6 @@
 from __future__ import annotations
+import math
+
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtWidgets import (
@@ -26,6 +28,7 @@ class PitchView(QGraphicsView):
         self._duration: float = 0.0
         self._title: str = ""
         self._zoom: float = 1.0
+        self._view_offset: float = 0.0  # start of the visible window (seconds)
         self._playhead_time: float = -1.0
 
         self._scene = QGraphicsScene(self)
@@ -80,6 +83,7 @@ class PitchView(QGraphicsView):
         self._selection_start = -1.0
         self._selection_end = -1.0
         self._selection_rect.setRect(0, 0, 0, 0)
+        self._view_offset = 0.0
         self._redraw()
 
     def set_title(self, title: str):
@@ -88,6 +92,7 @@ class PitchView(QGraphicsView):
 
     def set_zoom(self, zoom: float):
         self._zoom = zoom
+        self._clamp_offset()
         self._redraw()
 
     def set_playhead(self, time_val: float):
@@ -109,10 +114,41 @@ class PitchView(QGraphicsView):
 
     def _time_to_x(self, t: float) -> float:
         vr = self._view_rect()
-        duration = self._duration / self._zoom
-        if duration <= 0:
+        win = self._duration / self._zoom
+        if win <= 0:
             return vr.left()
-        return vr.left() + (t / duration) * vr.width()
+        return vr.left() + ((t - self._view_offset) / win) * vr.width()
+
+    def _clamp_offset(self):
+        if self._duration <= 0:
+            self._view_offset = 0.0
+            return
+        win = self._duration / self._zoom
+        if win >= self._duration - 1e-9:
+            self._view_offset = 0.0
+        else:
+            self._view_offset = max(0.0, min(self._view_offset, self._duration - win))
+
+    def ensure_visible(self, t: float) -> bool:
+        """Pan the window so time t stays visible; redraws only if it moved."""
+        if self._times is None or self._duration <= 0:
+            return False
+        win = self._duration / self._zoom
+        if win >= self._duration - 1e-9:
+            self._view_offset = 0.0
+            return False
+        margin = win * 0.08
+        new_offset = self._view_offset
+        if t < self._view_offset + margin:
+            new_offset = t - margin
+        elif t > self._view_offset + win - margin:
+            new_offset = t - win + margin
+        new_offset = max(0.0, min(new_offset, self._duration - win))
+        if abs(new_offset - self._view_offset) < 1e-6:
+            return False
+        self._view_offset = new_offset
+        self._redraw()
+        return True
 
     def _freq_to_y(self, f: float) -> float:
         vr = self._view_rect()
@@ -130,6 +166,7 @@ class PitchView(QGraphicsView):
         if self._times is None:
             return
 
+        self._clamp_offset()
         vr = self._view_rect()
         self._bg_rect.setRect(vr)
 
@@ -137,9 +174,13 @@ class PitchView(QGraphicsView):
         # highlight stays visible after zoom / data changes.
         self._scene.addItem(self._selection_rect)
 
-        duration_display = self._duration / self._zoom
-        self._time_label.setPlainText(f"显示范围: {duration_display:.1f}s")
-        self._time_label.setPos(vr.right() - 100, vr.bottom() + 5)
+        win = self._duration / self._zoom
+        if self._view_offset > 0:
+            label_text = f"显示: {self._view_offset:.1f}s - {self._view_offset + win:.1f}s"
+        else:
+            label_text = f"显示范围: {win:.1f}s"
+        self._time_label.setPlainText(label_text)
+        self._time_label.setPos(vr.right() - 130, vr.bottom() + 5)
         self._scene.addItem(self._time_label)
 
         self._draw_grid(vr)
@@ -161,9 +202,10 @@ class PitchView(QGraphicsView):
         elif self._zoom >= 2:
             step = 0.5
 
-        duration_display = self._duration / self._zoom
-        x = 0.0
-        while x <= duration_display + step:
+        win = self._duration / self._zoom
+        t0 = math.floor(self._view_offset / step) * step
+        x = t0
+        while x <= self._view_offset + win + step:
             px = self._time_to_x(x)
             if vr.left() <= px <= vr.right():
                 line = self._scene.addLine(px, vr.top(), px, vr.bottom())
@@ -276,13 +318,15 @@ class PitchView(QGraphicsView):
         if self._selecting and event.button() == Qt.MouseButton.LeftButton:
             self._selecting = False
             vr = self._view_rect()
-            duration = self._duration / self._zoom
-            if duration <= 0:
+            win = self._duration / self._zoom
+            if win <= 0:
                 return
             x1 = self._select_start_x
             x2 = event.position().x()
-            t1 = max(0, min(1, (x1 - vr.left()) / vr.width())) * duration
-            t2 = max(0, min(1, (x2 - vr.left()) / vr.width())) * duration
+            frac1 = max(0.0, min(1.0, (x1 - vr.left()) / vr.width()))
+            frac2 = max(0.0, min(1.0, (x2 - vr.left()) / vr.width()))
+            t1 = min(self._duration, self._view_offset + frac1 * win)
+            t2 = min(self._duration, self._view_offset + frac2 * win)
             self._selection_start = min(t1, t2)
             self._selection_end = max(t1, t2)
             self.selection_changed.emit(self._selection_start, self._selection_end)
@@ -301,6 +345,19 @@ class PitchView(QGraphicsView):
                 self._parent._zoom_to_index(cur)
             event.accept()
             return
+        # Plain wheel pans horizontally when zoomed in.
+        if self._times is not None and self._duration > 0:
+            win = self._duration / self._zoom
+            if win < self._duration - 1e-9:
+                shift = win * 0.15
+                if event.angleDelta().y() > 0:
+                    self._view_offset -= shift
+                else:
+                    self._view_offset += shift
+                self._clamp_offset()
+                self._redraw()
+                event.accept()
+                return
         super().wheelEvent(event)
 
     def _show_context_menu(self, event):

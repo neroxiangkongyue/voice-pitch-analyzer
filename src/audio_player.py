@@ -39,18 +39,21 @@ class AudioPlayer:
         sr: int,
         start: float = 0.0,
         end: float | None = None,
-    ) -> None:
+    ) -> bool:
         """Play audio[start*sr : end*sr] (end=None plays to the end).
 
-        Stops any ongoing playback first; empty segments return silently.
+        Stops any ongoing playback first; empty segments return False without
+        touching audio hardware. Returns True when a stream was started.
         current_time is absolute on the audio timeline (start + elapsed).
         """
         self.stop()
-        start_idx = int(start * sr)
-        end_idx = len(audio) if end is None else int(end * sr)
+        start_idx = int(max(0.0, start) * sr)
+        end_idx = len(audio) if end is None else int(min(float(end), len(audio) / sr) * sr)
+        if end_idx <= start_idx:
+            return False
         segment = np.asarray(audio[start_idx:end_idx], dtype=np.float32)
         if segment.size == 0:
-            return
+            return False
 
         self._playing = True
         self._pos = 0
@@ -61,6 +64,9 @@ class AudioPlayer:
                 raise sd.CallbackStop
             i = self._pos
             n = min(segment.size - i, frames)
+            if n <= 0:
+                outdata[:] = 0
+                raise sd.CallbackStop
             outdata[:n, 0] = segment[i:i + n]
             outdata[n:] = 0
             self._pos += n
@@ -93,6 +99,7 @@ class AudioPlayer:
 
         self._thread = threading.Thread(target=wait_done, daemon=True, name="AudioPlayer")
         self._thread.start()
+        return True
 
     def stop(self) -> None:
         self._playing = False
