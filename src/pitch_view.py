@@ -4,10 +4,10 @@ import math
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtWidgets import (
-    QGraphicsView, QGraphicsScene, QMenu, QGraphicsLineItem, QGraphicsPolygonItem,
+    QGraphicsView, QGraphicsScene, QMenu, QGraphicsLineItem, QGraphicsPathItem,
 )
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, Slot
-from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QCursor, QPolygonF
+from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QCursor, QPolygonF, QPainterPath
 
 pg.setConfigOption("background", "w")
 pg.setConfigOption("foreground", "k")
@@ -205,9 +205,13 @@ class PitchView(QGraphicsView):
         if self._selection_start >= 0 and self._selection_end >= 0:
             x1 = self._time_to_x(self._selection_start)
             x2 = self._time_to_x(self._selection_end)
-            self._selection_rect.setRect(
-                min(x1, x2), vr.top(), abs(x2 - x1), vr.height()
-            )
+            if abs(self._selection_end - self._selection_start) < 1e-6:
+                # Single-click marker: render as a thin vertical line.
+                self._selection_rect.setRect(x1 - 1, vr.top(), 2, vr.height())
+            else:
+                self._selection_rect.setRect(
+                    min(x1, x2), vr.top(), abs(x2 - x1), vr.height()
+                )
 
         self._update_playhead()
 
@@ -253,11 +257,11 @@ class PitchView(QGraphicsView):
             line.setPen(QPen(QColor(220, 220, 220), 0.5))
 
             name = _note_name(midi)
-            if half_px >= 14:
+            if half_px >= 10:
                 show = True
-            elif half_px >= 8:
+            elif half_px >= 5:
                 show = "#" not in name  # naturals only
-            elif half_px >= 4:
+            elif half_px >= 2.5:
                 show = midi % 12 == 0  # C per octave
             else:
                 show = midi % 12 == 0 and (midi // 12) % 2 == 0  # C every other octave
@@ -265,6 +269,19 @@ class PitchView(QGraphicsView):
                 label = self._scene.addText(name)
                 label.setFont(QFont("Consolas", 7))
                 label.setPos(vr.left() - 38, py - 7)
+
+    @staticmethod
+    def _polyline_item(points: list[QPointF], pen: QPen) -> QGraphicsPathItem:
+        """Open polyline: unlike QPolygonF it never closes the path."""
+        path = QPainterPath()
+        if points:
+            path.moveTo(points[0])
+            for p in points[1:]:
+                path.lineTo(p)
+        item = QGraphicsPathItem(path)
+        item.setPen(pen)
+        item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        return item
 
     def _draw_pitch_curve(self, vr: QRectF):
         if self._f0 is None:
@@ -277,10 +294,7 @@ class PitchView(QGraphicsView):
             vx = self._time_to_x(self._times[voiced_mask])
             vy = self._freq_to_y(self._f0[voiced_mask])
             points = [QPointF(float(x), float(y)) for x, y in zip(vx, vy)]
-            poly = QPolygonF(points)
-            item = QGraphicsPolygonItem(poly)
-            item.setPen(QPen(QColor(41, 128, 185), 1.5))
-            item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            item = self._polyline_item(points, QPen(QColor(41, 128, 185), 1.5))
             self._scene.addItem(item)
             self._pitch_items.append(item)
 
@@ -288,12 +302,9 @@ class PitchView(QGraphicsView):
             ux = self._time_to_x(self._times[unvoiced_mask])
             y_const = self._freq_to_y(self._fmin)
             points = [QPointF(float(x), float(y_const)) for x in ux]
-            poly = QPolygonF(points)
-            item = QGraphicsPolygonItem(poly)
             pen = QPen(QColor(189, 195, 199), 0.5)
             pen.setStyle(Qt.PenStyle.DashLine)
-            item.setPen(pen)
-            item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            item = self._polyline_item(points, pen)
             self._scene.addItem(item)
             self._pitch_items.append(item)
 
@@ -361,8 +372,14 @@ class PitchView(QGraphicsView):
             frac2 = max(0.0, min(1.0, (x2 - vr.left()) / vr.width()))
             t1 = min(self._duration, self._view_offset + frac1 * win)
             t2 = min(self._duration, self._view_offset + frac2 * win)
-            self._selection_start = min(t1, t2)
-            self._selection_end = max(t1, t2)
+            if abs(x2 - x1) < 4:
+                # Plain click (no drag): drop a single-point marker line.
+                t = min(t1, t2)
+                self._selection_start = self._selection_end = t
+            else:
+                self._selection_start = min(t1, t2)
+                self._selection_end = max(t1, t2)
+            self._redraw()
             self.selection_changed.emit(self._selection_start, self._selection_end)
 
         super().mouseReleaseEvent(event)
@@ -398,14 +415,21 @@ class PitchView(QGraphicsView):
         if self._selection_start < 0 or self._selection_end < 0:
             return
         menu = QMenu(self)
-        action = menu.addAction("播放选区")
+        if abs(self._selection_end - self._selection_start) < 1e-6:
+            action = menu.addAction("从此处播放到结尾")
+        else:
+            action = menu.addAction("播放选区")
         action.triggered.connect(self._play_selection)
         menu.exec(QCursor.pos())
 
     @Slot()
     def _play_selection(self):
-        if self._parent is not None and self._selection_start >= 0 and self._selection_end >= 0:
+        if self._parent is None or self._selection_start < 0:
+            return
+        if self._selection_end > self._selection_start:
             self._parent._start_playback(self._selection_start, self._selection_end)
+        else:
+            self._parent._start_playback(self._selection_start, None)
 
     def selection_start_time(self) -> float:
         return self._selection_start

@@ -118,15 +118,26 @@ class MainWindow(QMainWindow):
         if self._pitch_engine_warm:
             return
         self._pitch_engine_warm = True
+        self.statusBar().showMessage("正在预热分析引擎（首次启动需要几秒）...")
+        self._warmup_thread = threading.Thread(
+            target=self._run_pitch_warmup, daemon=True, name="pitch-warmup"
+        )
+        self._warmup_thread.start()
+        QTimer.singleShot(100, self._check_warmup_done)
 
-        def _run():
-            try:
-                silence = np.zeros(16000, dtype=np.float32)  # 1 s @ 16 kHz
-                extract_pitch(silence, 16000)
-            except Exception:
-                pass  # Warmup is best-effort only.
+    def _run_pitch_warmup(self):
+        try:
+            silence = np.zeros(16000, dtype=np.float32)  # 1 s @ 16 kHz
+            extract_pitch(silence, 16000)
+        except Exception:
+            pass  # Warmup is best-effort only.
 
-        threading.Thread(target=_run, daemon=True, name="pitch-warmup").start()
+    def _check_warmup_done(self):
+        t = getattr(self, "_warmup_thread", None)
+        if t is not None and t.is_alive():
+            QTimer.singleShot(100, self._check_warmup_done)
+            return
+        self.statusBar().showMessage("分析引擎已就绪", 3000)
 
     # ── UI Build ──────────────────────────────────────────────────
 
@@ -415,10 +426,12 @@ class MainWindow(QMainWindow):
         if self._player.is_playing:
             self._stop_playback()
         elif self._doc is not None:
-            self._start_playback(
-                self._pv.selection_start_time(),
-                self._pv.selection_end_time(),
-            )
+            start = self._pv.selection_start_time()
+            end = self._pv.selection_end_time()
+            # Single-point marker (or no selection): play through to the end.
+            if end <= start:
+                end = None
+            self._start_playback(start, end)
 
     def _start_playback(self, start: float, end: float | None = None):
         """Play [start, end) of the active document; end<=0 plays everything."""
