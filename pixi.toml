@@ -9,9 +9,9 @@ platforms = ["win-64"]
 python = ">=3.12,<3.14"
 ffmpeg = "*"
 pip = "*"
+pyside6 = "*"
 
 [pypi-dependencies]
-pyside6 = "*"
 pyqtgraph = "*"
 librosa = "*"
 soundfile = "*"
