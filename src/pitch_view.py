@@ -12,6 +12,22 @@ from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QCursor, QPolyg
 pg.setConfigOption("background", "w")
 pg.setConfigOption("foreground", "k")
 
+# Note names for the pitch (Y) axis, based on A4 = 440 Hz equal temperament.
+_NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+_A4_MIDI = 69  # A4
+
+
+def _midi_to_freq(midi: float) -> float:
+    return 440.0 * 2.0 ** ((midi - _A4_MIDI) / 12.0)
+
+
+def _freq_to_midi(freq: float) -> float:
+    return _A4_MIDI + 12.0 * math.log2(max(freq, 1e-6) / 440.0)
+
+
+def _note_name(midi: int) -> str:
+    return f"{_NOTE_NAMES[midi % 12]}{midi // 12 - 1}"
+
 
 class PitchView(QGraphicsView):
     selection_changed = Signal(float, float)
@@ -215,22 +231,40 @@ class PitchView(QGraphicsView):
                 label.setPos(px - 15, vr.bottom() + 2)
             x += step
 
-        freq_step = 50
-        if self._fmax - self._fmin < 200:
-            freq_step = 25
-        elif self._fmax - self._fmin > 1000:
-            freq_step = 100
+        # Pitch grid: one line per semitone (A4 = 440 Hz), labeled with note
+        # names. Label density adapts to the pixel spacing so labels never
+        # overlap: every semitone → naturals only → C per octave → every
+        # other octave's C.
+        half_px = abs(
+            self._freq_to_y(_midi_to_freq(_A4_MIDI + 1))
+            - self._freq_to_y(_midi_to_freq(_A4_MIDI))
+        )
+        midi_lo = math.floor(_freq_to_midi(self._fmin))
+        midi_hi = math.ceil(_freq_to_midi(self._fmax))
 
-        f = self._fmin
-        while f <= self._fmax + freq_step:
+        for midi in range(midi_lo, midi_hi + 1):
+            f = _midi_to_freq(midi)
+            if f < self._fmin or f > self._fmax:
+                continue
             py = self._freq_to_y(f)
-            if vr.top() <= py <= vr.bottom():
-                line = self._scene.addLine(vr.left(), py, vr.right(), py)
-                line.setPen(QPen(QColor(220, 220, 220), 0.5))
-                label = self._scene.addText(f"{int(f)}Hz")
+            if not (vr.top() <= py <= vr.bottom()):
+                continue
+            line = self._scene.addLine(vr.left(), py, vr.right(), py)
+            line.setPen(QPen(QColor(220, 220, 220), 0.5))
+
+            name = _note_name(midi)
+            if half_px >= 14:
+                show = True
+            elif half_px >= 8:
+                show = "#" not in name  # naturals only
+            elif half_px >= 4:
+                show = midi % 12 == 0  # C per octave
+            else:
+                show = midi % 12 == 0 and (midi // 12) % 2 == 0  # C every other octave
+            if show:
+                label = self._scene.addText(name)
                 label.setFont(QFont("Consolas", 7))
-                label.setPos(vr.left() - 45, py - 7)
-            f += freq_step
+                label.setPos(vr.left() - 38, py - 7)
 
     def _draw_pitch_curve(self, vr: QRectF):
         if self._f0 is None:
