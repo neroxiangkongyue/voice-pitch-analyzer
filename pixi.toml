@@ -1,6 +1,6 @@
 [workspace]
 name = "voice-pitch-analyzer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Voice pitch (F0) visualization tool with zoom, playback, and recording"
 channels = ["conda-forge"]
 platforms = ["win-64"]

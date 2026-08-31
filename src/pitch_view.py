@@ -1,9 +1,11 @@
 from __future__ import annotations
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QWidget, QMenu, QGraphicsLineItem, QGraphicsTextItem
+from PySide6.QtWidgets import (
+    QGraphicsView, QGraphicsScene, QMenu, QGraphicsLineItem, QGraphicsPolygonItem,
+)
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, Slot
-from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QCursor
+from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QFont, QCursor, QPolygonF
 
 pg.setConfigOption("background", "w")
 pg.setConfigOption("foreground", "k")
@@ -74,6 +76,10 @@ class PitchView(QGraphicsView):
         self._fmin = fmin
         self._fmax = fmax
         self._duration = times[-1] if len(times) > 0 and times[-1] > 0 else len(f0) * (frame_dt(times))
+        # Selection is stored in seconds, so it is meaningless across datasets.
+        self._selection_start = -1.0
+        self._selection_end = -1.0
+        self._selection_rect.setRect(0, 0, 0, 0)
         self._redraw()
 
     def set_title(self, title: str):
@@ -119,8 +125,6 @@ class PitchView(QGraphicsView):
         for item in self._scene.items():
             if item is not self._bg_rect and item is not self._title_item:
                 self._scene.removeItem(item)
-        for item in self._pitch_items:
-            self._scene.removeItem(item)
         self._pitch_items.clear()
 
         if self._times is None:
@@ -128,6 +132,10 @@ class PitchView(QGraphicsView):
 
         vr = self._view_rect()
         self._bg_rect.setRect(vr)
+
+        # The purge above also removed the selection rect; put it back so the
+        # highlight stays visible after zoom / data changes.
+        self._scene.addItem(self._selection_rect)
 
         duration_display = self._duration / self._zoom
         self._time_label.setPlainText(f"显示范围: {duration_display:.1f}s")
@@ -192,33 +200,18 @@ class PitchView(QGraphicsView):
         if voiced_mask.any():
             vx = self._time_to_x(self._times[voiced_mask])
             vy = self._freq_to_y(self._f0[voiced_mask])
-            line = self._scene.addLine(0, 0, 0, 0)
-            line.setPen(QPen(QColor(41, 128, 185), 1.5))
-
-            points = []
-            for i in range(len(vx)):
-                points.append(QPointF(float(vx[i]), float(vy[i])))
-
-            # Use polyline for efficiency
-            from PySide6.QtWidgets import QGraphicsPolygonItem
-            from PySide6.QtGui import QPolygonF
+            points = [QPointF(float(x), float(y)) for x, y in zip(vx, vy)]
             poly = QPolygonF(points)
             item = QGraphicsPolygonItem(poly)
             item.setPen(QPen(QColor(41, 128, 185), 1.5))
             item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
             self._scene.addItem(item)
             self._pitch_items.append(item)
-            self._scene.removeItem(line)
 
         if unvoiced_mask.any():
             ux = self._time_to_x(self._times[unvoiced_mask])
             y_const = self._freq_to_y(self._fmin)
-            points = []
-            for i in range(len(ux)):
-                points.append(QPointF(float(ux[i]), float(y_const)))
-
-            from PySide6.QtWidgets import QGraphicsPolygonItem
-            from PySide6.QtGui import QPolygonF
+            points = [QPointF(float(x), float(y_const)) for x in ux]
             poly = QPolygonF(points)
             item = QGraphicsPolygonItem(poly)
             pen = QPen(QColor(189, 195, 199), 0.5)
@@ -229,15 +222,18 @@ class PitchView(QGraphicsView):
             self._pitch_items.append(item)
 
     def _update_playhead(self):
+        in_scene = self._playhead_line.scene() is self._scene
         if self._playhead_time < 0:
-            self._scene.removeItem(self._playhead_line)
+            if in_scene:
+                self._scene.removeItem(self._playhead_line)
             return
         vr = self._view_rect()
         x = self._time_to_x(self._playhead_time)
         if vr.left() <= x <= vr.right():
             self._playhead_line.setLine(x, vr.top(), x, vr.bottom())
-            self._scene.addItem(self._playhead_line)
-        else:
+            if not in_scene:
+                self._scene.addItem(self._playhead_line)
+        elif in_scene:
             self._scene.removeItem(self._playhead_line)
 
     def mousePressEvent(self, event):
@@ -317,15 +313,8 @@ class PitchView(QGraphicsView):
 
     @Slot()
     def _play_selection(self):
-        if self._parent is not None:
-            parent = self._parent
-            if parent._audio is not None:
-                parent._player.play(
-                    parent._audio, parent._sr,
-                    start=self._selection_start,
-                    end=self._selection_end,
-                    progress_callback=parent._on_play_progress,
-                )
+        if self._parent is not None and self._selection_start >= 0 and self._selection_end >= 0:
+            self._parent._start_playback(self._selection_start, self._selection_end)
 
     def selection_start_time(self) -> float:
         return self._selection_start

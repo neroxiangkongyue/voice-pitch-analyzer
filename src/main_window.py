@@ -1,14 +1,16 @@
 from __future__ import annotations
 import sys
+from dataclasses import dataclass
+
 import numpy as np
 from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QAction, QDrag, QKeySequence
-from PySide6.QtCore import Qt, QTimer, Slot, Signal, QMimeData, QSize
+from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import Qt, QTimer, Slot, QSize
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QSlider, QGroupBox, QStyleFactory,
-    QMessageBox, QComboBox, QListWidget, QListWidgetItem, QSizePolicy,
-    QMenu, QToolBar, QStatusBar, QSplitter, QTextEdit,
+    QMessageBox, QListWidget, QListWidgetItem, QSizePolicy,
+    QToolBar, QSplitter,
 )
 
 from src.audio_loader import load_audio
@@ -21,6 +23,21 @@ from src.pitch_view import PitchView
 SUPPORTED_EXTS = "Audio Files (*.wav *.mp3 *.flac *.m4a *.aac *.ogg);;All Files (*)"
 
 
+@dataclass
+class AudioDocument:
+    """One loaded audio clip plus its cached analysis results."""
+
+    title: str
+    audio: np.ndarray
+    sr: int
+    times: np.ndarray
+    f0: np.ndarray
+    confidence: np.ndarray
+    fmin: float
+    fmax: float
+    path: str = ""
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -28,19 +45,15 @@ class MainWindow(QMainWindow):
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint)
         self.resize(1280, 720)
 
-        self._audio: np.ndarray | None = None
-        self._sr: int = 16000
-        self._times: np.ndarray | None = None
-        self._f0: np.ndarray | None = None
-        self._confidence: np.ndarray | None = None
-        self._current_file: str = ""
+        self._doc: AudioDocument | None = None
+        self._docs: list[AudioDocument] = []
+        self._placeholder_active = True
+        self._recording_counter = 0
 
         self._recorder = AudioRecorder()
         self._player = AudioPlayer()
         self._play_timer = QTimer()
         self._play_timer.timeout.connect(self._on_play_tick)
-        self._play_start = 0.0
-        self._play_segment_start = 0.0
 
         self._current_zoom = 1.0
         self._zoom_steps = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
@@ -121,6 +134,7 @@ class MainWindow(QMainWindow):
 
         self._file_list = QListWidget()
         self._file_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._file_list.itemClicked.connect(self._on_file_selected)
         file_layout.addWidget(self._file_list)
 
         add_btn = QPushButton("添加...")
@@ -174,29 +188,50 @@ class MainWindow(QMainWindow):
             self._load_file(p)
 
     def _load_file(self, path: str):
+        # Reload of a known path just switches to its cached document.
+        for doc in self._docs:
+            if doc.path == path:
+                self._activate_document(doc)
+                return
         self.statusBar().showMessage(f"正在加载: {path}")
         QApplication.processEvents()
         try:
             audio, sr = load_audio(path)
-            self._audio = audio
-            self._sr = sr
-            self._current_file = path
-
-            self._times, self._f0, self._confidence = extract_pitch(audio, sr)
-            fmin, fmax = detect_frequency_range(self._f0, len(audio) / sr)
-
-            self._pv.set_data(self._times, self._f0, self._confidence, fmin, fmax)
-            self._pv.set_title(path)
-            self._zoom_to_index(2)
-
-            self._file_list.clear()
-            self._file_list.addItem(QListWidgetItem(path))
-
-            duration = len(audio) / sr
-            self.statusBar().showMessage(f"已加载: {path}  |  时长: {duration:.2f}s  |  采样率: {sr}")
+            times, f0, confidence = extract_pitch(audio, sr)
+            fmin, fmax = detect_frequency_range(f0, len(audio) / sr)
+            self._add_document(AudioDocument(
+                title=path, path=path, audio=audio, sr=sr,
+                times=times, f0=f0, confidence=confidence,
+                fmin=fmin, fmax=fmax,
+            ))
         except Exception as e:
             QMessageBox.critical(self, "加载失败", str(e))
             self.statusBar().showMessage("加载失败")
+
+    def _add_document(self, doc: AudioDocument):
+        if self._placeholder_active:
+            self._file_list.clear()
+            self._placeholder_active = False
+        self._docs.append(doc)
+        item = QListWidgetItem(doc.title)
+        item.setData(Qt.ItemDataRole.UserRole, doc)
+        self._file_list.addItem(item)
+        self._activate_document(doc)
+
+    def _activate_document(self, doc: AudioDocument):
+        self._stop_playback()
+        self._doc = doc
+        self._pv.set_data(doc.times, doc.f0, doc.confidence, doc.fmin, doc.fmax)
+        self._pv.set_title(doc.title)
+        self._zoom_to_index(2)
+        duration = len(doc.audio) / doc.sr
+        self.statusBar().showMessage(f"已加载: {doc.title}  |  时长: {duration:.2f}s  |  采样率: {doc.sr}")
+
+    @Slot(QListWidgetItem)
+    def _on_file_selected(self, item: QListWidgetItem):
+        doc = item.data(Qt.ItemDataRole.UserRole)
+        if doc is not None and doc is not self._doc:
+            self._activate_document(doc)
 
     # ── Recording ─────────────────────────────────────────────────
 
@@ -213,51 +248,65 @@ class MainWindow(QMainWindow):
         else:
             audio, sr = self._recorder.stop()
             self._record_btn.setText("录音")
-            if len(audio) > 0:
-                self._audio = audio
-                self._sr = sr
-                self._times, self._f0, self._confidence = extract_pitch(audio, sr)
-                fmin, fmax = detect_frequency_range(self._f0, len(audio) / sr)
-                self._pv.set_data(self._times, self._f0, self._confidence, fmin, fmax)
-                self._pv.set_title("[录音]")
-                self._zoom_to_index(2)
-                self._file_list.clear()
-                self._file_list.addItem(QListWidgetItem("[麦克风录音]"))
-                self.statusBar().showMessage(f"录音完成: {len(audio) / sr:.2f}s")
-            else:
+            if len(audio) == 0:
                 self.statusBar().showMessage("录音为空")
+                return
+            try:
+                times, f0, confidence = extract_pitch(audio, sr)
+                fmin, fmax = detect_frequency_range(f0, len(audio) / sr)
+            except Exception as e:
+                QMessageBox.critical(self, "分析失败", str(e))
+                return
+            self._recording_counter += 1
+            self._add_document(AudioDocument(
+                title=f"[录音 {self._recording_counter}]", audio=audio, sr=sr,
+                times=times, f0=f0, confidence=confidence, fmin=fmin, fmax=fmax,
+            ))
+            self.statusBar().showMessage(f"录音完成: {len(audio) / sr:.2f}s")
 
     # ── Playback ──────────────────────────────────────────────────
 
     @Slot()
     def _on_toggle_play(self):
-        if not self._audio is None and not self._player.is_playing:
-            start = self._pv.selection_start_time()
-            end = self._pv.selection_end_time()
-            self._play_start = 0.0
-            self._play_segment_start = start if start >= 0 else 0.0
-            self._player.play(
-                self._audio, self._sr,
-                start=self._play_segment_start,
-                end=end if end > 0 else None,
-                progress_callback=self._on_play_progress,
+        if self._player.is_playing:
+            self._stop_playback()
+        elif self._doc is not None:
+            self._start_playback(
+                self._pv.selection_start_time(),
+                self._pv.selection_end_time(),
             )
-            self._play_timer.start(30)
-            self._play_btn.setText("停止")
-        else:
-            self._player.stop()
-            self._play_timer.stop()
-            self._play_btn.setText("播放")
-            self._pv.set_playhead(-1)
+
+    def _start_playback(self, start: float, end: float | None = None):
+        """Play [start, end) of the active document; end<=0 plays everything."""
+        if self._doc is None:
+            return
+        self._player.play(
+            self._doc.audio, self._doc.sr,
+            start=max(0.0, start),
+            end=end if end and end > 0 else None,
+        )
+        self._play_timer.start(30)
+        self._play_btn.setText("停止")
+
+    def _stop_playback(self):
+        self._player.stop()
+        self._reset_play_ui()
+
+    def _reset_play_ui(self):
+        self._play_timer.stop()
+        self._play_btn.setText("播放")
+        self._pv.set_playhead(-1)
+        self._playback_pos.setText("0.000s")
 
     @Slot()
     def _on_play_tick(self):
-        pass
-
-    def _on_play_progress(self, elapsed: float):
-        actual = self._play_segment_start + elapsed if self._play_segment_start > 0 else elapsed
-        self._pv.set_playhead(actual)
-        self._playback_pos.setText(f"{actual:.3f}s")
+        # UI-thread poll: refresh the playhead; reset UI once playback ends.
+        if self._player.is_playing:
+            t = self._player.current_time
+            self._pv.set_playhead(t)
+            self._playback_pos.setText(f"{t:.3f}s")
+        else:
+            self._reset_play_ui()
 
     # ── Zoom ──────────────────────────────────────────────────────
 
