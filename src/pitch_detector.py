@@ -1,3 +1,6 @@
+import hashlib
+import os
+
 import numpy as np
 import librosa
 
@@ -56,3 +59,50 @@ def detect_frequency_range(f0: np.ndarray, _audio_length: float) -> tuple[float,
     high = min(2000.0, float(np.percentile(valid, 95)))
     margin = (high - low) * 0.1
     return max(50.0, low - margin), min(2000.0, high + margin)
+
+
+def _cache_file_for(filepath: str, sr: int) -> str:
+    """Cache file path keyed on path + mtime + size + analysis parameters."""
+    st = os.stat(filepath)
+    key = (
+        f"{os.path.abspath(filepath).lower()}|{st.st_mtime_ns}|{st.st_size}"
+        f"|{sr}|sr{ANALYSIS_SR}|hop{ANALYSIS_HOP}|v1"
+    )
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    cache_dir = os.path.join(base, "VoicePitchAnalyzer", "analysis_cache")
+    return os.path.join(cache_dir, digest + ".npz")
+
+
+def extract_pitch_cached(
+    filepath: str, audio: np.ndarray, sr: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """extract_pitch with a per-file disk cache keyed on path+mtime+size.
+
+    Re-opening the same file (even after restarting the app) skips the pyin
+    computation entirely. Cache write failures are silently ignored.
+    """
+    try:
+        cache_file = _cache_file_for(filepath, sr)
+    except OSError:
+        cache_file = None
+
+    if cache_file and os.path.exists(cache_file):
+        try:
+            with np.load(cache_file) as data:
+                return data["times"], data["f0"], data["confidence"]
+        except Exception:
+            pass  # Corrupt cache: fall through to full analysis.
+
+    times, f0, confidence = extract_pitch(audio, sr)
+
+    if cache_file:
+        try:
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            np.savez_compressed(
+                cache_file, times=times, f0=f0, confidence=confidence
+            )
+        except Exception:
+            pass  # Best effort only.
+
+    return times, f0, confidence

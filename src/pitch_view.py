@@ -304,6 +304,7 @@ class PitchView(QGraphicsView):
             vy = self._freq_to_y(self._f0[voiced_mask])
             points = [QPointF(float(x), float(y)) for x, y in zip(vx, vy)]
             item = self._polyline_item(points, QPen(QColor(41, 128, 185), 1.5))
+            item.setClipRect(vr)  # keep the curve inside the plot background
             self._scene.addItem(item)
             self._pitch_items.append(item)
 
@@ -324,6 +325,7 @@ class PitchView(QGraphicsView):
                 pen = QPen(QColor(189, 195, 199), 0.5)
                 pen.setStyle(Qt.PenStyle.DashLine)
                 item = self._polyline_item(points, pen)
+                item.setClipRect(vr)  # keep the dash line inside the plot area
                 self._scene.addItem(item)
                 self._pitch_items.append(item)
 

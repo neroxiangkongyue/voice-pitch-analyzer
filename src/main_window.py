@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.audio_loader import load_audio
-from src.pitch_detector import extract_pitch, detect_frequency_range
+from src.pitch_detector import extract_pitch, extract_pitch_cached, detect_frequency_range
 from src.audio_recorder import AudioRecorder
 from src.audio_player import AudioPlayer
 from src.pitch_view import PitchView
@@ -65,7 +65,7 @@ class _LoadWorker(QObject):
             self.progress.emit(i, total, os.path.basename(path))
             try:
                 audio, sr = load_audio(path)
-                times, f0, confidence = extract_pitch(audio, sr)
+                times, f0, confidence = extract_pitch_cached(path, audio, sr)
                 fmin, fmax = detect_frequency_range(f0, len(audio) / sr)
                 self.loaded.emit(AudioDocument(
                     title=path, path=path,
