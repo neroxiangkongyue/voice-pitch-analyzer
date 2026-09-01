@@ -14,6 +14,20 @@ from PySide6.QtGui import (
 pg.setConfigOption("background", "w")
 pg.setConfigOption("foreground", "k")
 
+
+class _ClippedPathItem(QGraphicsPathItem):
+    """Path item whose painting is clipped to a fixed scene-space rect."""
+
+    def __init__(self, path: QPainterPath, clip_rect: QRectF):
+        super().__init__(path)
+        self._clip_rect = QRectF(clip_rect)
+
+    def paint(self, painter, option, widget=None):
+        painter.save()
+        painter.setClipRect(self._clip_rect)
+        super().paint(painter, option, widget)
+        painter.restore()
+
 # Note names for the pitch (Y) axis, based on A4 = 440 Hz equal temperament.
 _NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 _A4_MIDI = 69  # A4
@@ -280,14 +294,18 @@ class PitchView(QGraphicsView):
                 label.setPos(vr.left() - 38, py - 7)
 
     @staticmethod
-    def _polyline_item(points: list[QPointF], pen: QPen) -> QGraphicsPathItem:
-        """Open polyline: unlike QPolygonF it never closes the path."""
+    def _polyline_item(points: list[QPointF], pen: QPen, clip_rect: QRectF) -> QGraphicsPathItem:
+        """Open polyline clipped to clip_rect while painting.
+
+        PySide6 does not expose QGraphicsItem.setClipRect, so clipping is done
+        inside paint() — this keeps pan/zoom from drawing outside the plot.
+        """
         path = QPainterPath()
         if points:
             path.moveTo(points[0])
             for p in points[1:]:
                 path.lineTo(p)
-        item = QGraphicsPathItem(path)
+        item = _ClippedPathItem(path, clip_rect)
         item.setPen(pen)
         item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         return item
@@ -303,8 +321,7 @@ class PitchView(QGraphicsView):
             vx = self._time_to_x(self._times[voiced_mask])
             vy = self._freq_to_y(self._f0[voiced_mask])
             points = [QPointF(float(x), float(y)) for x, y in zip(vx, vy)]
-            item = self._polyline_item(points, QPen(QColor(41, 128, 185), 1.5))
-            item.setClipRect(vr)  # keep the curve inside the plot background
+            item = self._polyline_item(points, QPen(QColor(41, 128, 185), 1.5), vr)
             self._scene.addItem(item)
             self._pitch_items.append(item)
 
@@ -324,8 +341,7 @@ class PitchView(QGraphicsView):
                 points = [QPointF(float(x), float(y_const)) for x in ux]
                 pen = QPen(QColor(189, 195, 199), 0.5)
                 pen.setStyle(Qt.PenStyle.DashLine)
-                item = self._polyline_item(points, pen)
-                item.setClipRect(vr)  # keep the dash line inside the plot area
+                item = self._polyline_item(points, pen, vr)
                 self._scene.addItem(item)
                 self._pitch_items.append(item)
 
