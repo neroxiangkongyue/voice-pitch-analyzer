@@ -31,6 +31,11 @@ def _note_name(midi: int) -> str:
     return f"{_NOTE_NAMES[midi % 12]}{midi // 12 - 1}"
 
 
+# Unvoiced stretches longer than this are not drawn at all (only short gaps
+# between voiced parts keep the dashed baseline marker).
+SILENT_HIDE_S = 1.0
+
+
 class PitchView(QGraphicsView):
     selection_changed = Signal(float, float)
 
@@ -303,14 +308,24 @@ class PitchView(QGraphicsView):
             self._pitch_items.append(item)
 
         if unvoiced_mask.any():
-            ux = self._time_to_x(self._times[unvoiced_mask])
-            y_const = self._freq_to_y(self._fmin)
-            points = [QPointF(float(x), float(y_const)) for x in ux]
-            pen = QPen(QColor(189, 195, 199), 0.5)
-            pen.setStyle(Qt.PenStyle.DashLine)
-            item = self._polyline_item(points, pen)
-            self._scene.addItem(item)
-            self._pitch_items.append(item)
+            # Hide the unvoiced dash line for long silent stretches (>= 1 s):
+            # only short gaps stay marked so the baseline reads as "brief gaps",
+            # not as a permanent floor line.
+            idx_u = np.flatnonzero(unvoiced_mask)
+            breaks = np.flatnonzero(np.diff(idx_u) > 1)
+            runs = np.split(idx_u, breaks + 1)
+            keep = np.concatenate(
+                [r for r in runs if self._times[r[-1]] - self._times[r[0]] < SILENT_HIDE_S]
+            ) if any(self._times[r[-1]] - self._times[r[0]] < SILENT_HIDE_S for r in runs) else np.array([], dtype=int)
+            if keep.size:
+                ux = self._time_to_x(self._times[keep])
+                y_const = self._freq_to_y(self._fmin)
+                points = [QPointF(float(x), float(y_const)) for x in ux]
+                pen = QPen(QColor(189, 195, 199), 0.5)
+                pen.setStyle(Qt.PenStyle.DashLine)
+                item = self._polyline_item(points, pen)
+                self._scene.addItem(item)
+                self._pitch_items.append(item)
 
     def _update_playhead(self):
         in_scene = self._playhead_line.scene() is self._scene
