@@ -9,12 +9,15 @@ import librosa
 # practical accuracy loss. Playback still uses the original audio data.
 ANALYSIS_SR = 16000
 ANALYSIS_HOP = 256  # ~16 ms hop @ 16 kHz
+# ~64 ms window: long enough for ~50 Hz (3 periods) but short enough that
+# fast vocal pitch changes are not smeared across a 128 ms box.
+ANALYSIS_FRAME = 1024
 
 
 def extract_pitch(
     audio: np.ndarray,
     sr: int,
-    frame_length: int = 2048,
+    frame_length: int = ANALYSIS_FRAME,
     hop_length: int | None = None,
     fmin: float = 50.0,
     fmax: float = 500.0,
@@ -25,14 +28,11 @@ def extract_pitch(
         audio = librosa.resample(
             audio, orig_sr=sr, target_sr=ANALYSIS_SR, res_type="soxr_hq"
         )
-        if hop_length is not None:
-            hop_length = max(1, round(hop_length * ANALYSIS_SR / sr))
-        else:
-            hop_length = ANALYSIS_HOP
         sr = ANALYSIS_SR
-
+    # One hop for every input rate: keep temporal resolution consistent
+    # whether the file was already 16 kHz (mp3 path) or resampled from 44.1k+.
     if hop_length is None:
-        hop_length = frame_length // 4
+        hop_length = ANALYSIS_HOP
 
     result = librosa.pyin(
         audio,
@@ -44,9 +44,14 @@ def extract_pitch(
     )
     f0, voiced_confidence = result[0], result[1]
 
-    times = librosa.times_like(
-        f0, sr=sr, hop_length=hop_length, n_fft=frame_length
-    )
+    # pyin frames are center-padded; frame i is centred at i * hop / sr.
+    # Do NOT pass n_fft here — librosa.times_like(..., n_fft=...) shifts every
+    # stamp late by n_fft//2 / sr (64 ms at 16 kHz / 1024), which desyncs the
+    # curve from playback.
+    times = librosa.times_like(f0, sr=sr, hop_length=hop_length)
+    if len(times) and len(audio):
+        duration = len(audio) / sr
+        times = np.clip(times, 0.0, duration)
 
     return times, f0, voiced_confidence
 
@@ -66,7 +71,7 @@ def _cache_file_for(filepath: str, sr: int) -> str:
     st = os.stat(filepath)
     key = (
         f"{os.path.abspath(filepath).lower()}|{st.st_mtime_ns}|{st.st_size}"
-        f"|{sr}|sr{ANALYSIS_SR}|hop{ANALYSIS_HOP}|v1"
+        f"|{sr}|sr{ANALYSIS_SR}|hop{ANALYSIS_HOP}|frame{ANALYSIS_FRAME}|v2"
     )
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
