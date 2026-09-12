@@ -197,7 +197,7 @@ class MainWindow(QMainWindow):
 
         self._zoom_label = QLabel("1x")
         self._zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._zoom_label.setFixedWidth(40)
+        self._zoom_label.setMinimumWidth(56)
         toolbar.addWidget(self._zoom_label)
 
         layout.addWidget(toolbar)
@@ -506,10 +506,24 @@ class MainWindow(QMainWindow):
     def _zoom_to_index(self, idx: int):
         idx = max(0, min(idx, len(self._zoom_steps) - 1))
         self._current_zoom = self._zoom_steps[idx]
+        self._zoom_slider.blockSignals(True)
         self._zoom_slider.setValue(idx)
+        self._zoom_slider.blockSignals(False)
         self._zoom_label.setText(f"{self._current_zoom}x")
         if hasattr(self, "_pv"):
             self._pv.set_zoom(self._current_zoom)
+
+    def _on_custom_zoom(self, zoom: float):
+        """Continuous zoom (e.g. zoom-to-selection); sync label/slider without re-applying."""
+        self._current_zoom = zoom
+        self._zoom_label.setText(f"{zoom:.1f}x")
+        idx = min(
+            range(len(self._zoom_steps)),
+            key=lambda i: abs(self._zoom_steps[i] - zoom),
+        )
+        self._zoom_slider.blockSignals(True)
+        self._zoom_slider.setValue(idx)
+        self._zoom_slider.blockSignals(False)
 
     def _zoom_in(self):
         idx = self._zoom_slider.value()

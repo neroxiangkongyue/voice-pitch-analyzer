@@ -155,9 +155,47 @@ class PitchView(QGraphicsView):
         self._title_item.setPlainText(title)
 
     def set_zoom(self, zoom: float):
-        self._zoom = zoom
+        self._zoom = max(zoom, 0.05)
         self._clamp_offset()
         self._redraw()
+
+    def set_zoom_to_range(self, t0: float, t1: float):
+        """Fill the plot area with [t0, t1]; time axis follows the new window.
+
+        Zoom becomes continuous (can exceed the 16× ladder max).
+        """
+        if self._duration <= 0:
+            return
+        t0 = max(0.0, min(float(t0), self._duration))
+        t1 = max(0.0, min(float(t1), self._duration))
+        if t1 < t0:
+            t0, t1 = t1, t0
+        span = t1 - t0
+        if span < 1e-3:
+            # Marker click: show a short window around the point.
+            half = 0.5
+            t0 = max(0.0, t0 - half)
+            t1 = min(self._duration, t0 + 2 * half)
+            span = max(t1 - t0, 0.05)
+        pad = span * 0.02
+        t0 = max(0.0, t0 - pad)
+        t1 = min(self._duration, t0 + span + 2 * pad)
+        span = max(t1 - t0, 0.05)
+        self._view_offset = t0
+        self._zoom = self._duration / span
+        self._clamp_offset()
+        self._redraw()
+        if self._parent is not None and hasattr(self._parent, "_on_custom_zoom"):
+            self._parent._on_custom_zoom(self._zoom)
+
+    def zoom_factor(self) -> float:
+        return self._zoom
+
+    @Slot()
+    def _zoom_to_selection(self):
+        if self._selection_start < 0 or self._selection_end < 0:
+            return
+        self.set_zoom_to_range(self._selection_start, self._selection_end)
 
     def set_playhead(self, time_val: float):
         self._playhead_time = time_val
@@ -591,7 +629,7 @@ class PitchView(QGraphicsView):
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             steps = list(ZOOM_STEPS)
-            cur = steps.index(self._zoom) if self._zoom in steps else steps.index(1.0)
+            cur = min(range(len(steps)), key=lambda i: abs(steps[i] - self._zoom))
             if event.angleDelta().y() > 0:
                 cur = min(cur + 1, len(steps) - 1)
             else:
@@ -634,6 +672,8 @@ class PitchView(QGraphicsView):
                 lambda checked: self._parent._toggle_loop(checked)
                 if self._parent is not None else None
             )
+            zoom_action = menu.addAction("缩放到选区")
+            zoom_action.triggered.connect(self._zoom_to_selection)
         menu.exec(QCursor.pos())
 
     @Slot()
