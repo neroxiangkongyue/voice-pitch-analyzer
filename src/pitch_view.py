@@ -154,6 +154,39 @@ class PitchView(QGraphicsView):
         self._overlays.clear()
         self._redraw()
 
+    def first_voiced_time(self, lead_in: float = 0.15) -> float:
+        """Start of the first confidently voiced frame, minus a small lead-in."""
+        if self._times is None or self._f0 is None or self._confidence is None:
+            return 0.0
+        if len(self._times) == 0:
+            return 0.0
+        mask = ~np.isnan(self._f0) & (self._confidence > 0.05)
+        if not mask.any():
+            return 0.0
+        return max(0.0, float(self._times[mask][0]) - lead_in)
+
+    def focus_first_voiced(self):
+        """Park a partial view at the first voice so leading silence is skipped.
+
+        No-op when the whole clip fits on screen (overview starts at 0).
+        """
+        if self._times is None or self._duration <= 0:
+            return
+        t = self.first_voiced_time()
+        if t <= 0:
+            return
+        win = self._duration / self._zoom
+        if win >= self._duration - 1e-9:
+            return
+        self._view_offset = max(0.0, min(t, self._duration - win))
+        self._clamp_offset()
+        self._defer_pitch_range = False
+        self._pitch_range_timer.stop()
+        self._redraw()
+
+    def overlay_count(self) -> int:
+        return len(self._overlays)
+
     def clear_overlays(self):
         if not self._overlays:
             return

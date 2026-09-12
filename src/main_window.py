@@ -177,6 +177,11 @@ class MainWindow(QMainWindow):
         self._record_btn.clicked.connect(self._on_toggle_record)
         toolbar.addWidget(self._record_btn)
 
+        self._clear_overlay_btn = QPushButton("清空录音曲线")
+        self._clear_overlay_btn.setFixedHeight(28)
+        self._clear_overlay_btn.clicked.connect(self._on_clear_overlays)
+        toolbar.addWidget(self._clear_overlay_btn)
+
         toolbar.addSeparator()
 
         self._play_btn = QPushButton("播放")
@@ -405,6 +410,8 @@ class MainWindow(QMainWindow):
         self._pv.set_title(doc.title)
         # Default to a readable partial window; full clip is still one zoom-out away.
         self._zoom_to_index(self._pv.default_zoom_index())
+        # Skip leading silence once the window size is known.
+        self._pv.focus_first_voiced()
         duration = len(doc.audio) / doc.sr
         self.statusBar().showMessage(f"已加载: {doc.title}  |  时长: {duration:.2f}s  |  采样率: {doc.sr}")
 
@@ -469,6 +476,16 @@ class MainWindow(QMainWindow):
                 times=times, f0=f0, confidence=confidence, fmin=fmin, fmax=fmax,
             ))
             self.statusBar().showMessage(f"录音完成: {len(audio) / sr:.2f}s")
+
+    @Slot()
+    def _on_clear_overlays(self):
+        n = self._pv.overlay_count() if hasattr(self, "_pv") else 0
+        if n <= 0:
+            self.statusBar().showMessage("没有可清除的录音曲线")
+            return
+        self._pv.clear_overlays()
+        self._recording_counter = 0
+        self.statusBar().showMessage(f"已清空 {n} 条录音曲线")
 
     # ── Playback ──────────────────────────────────────────────────
 
