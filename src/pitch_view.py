@@ -6,7 +6,7 @@ import pyqtgraph as pg
 from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QMenu, QGraphicsLineItem, QGraphicsPathItem, QToolTip,
 )
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, Slot
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, Slot, QTimer
 from PySide6.QtGui import (
     QPainter, QPen, QColor, QBrush, QFont, QCursor, QPolygonF, QPainterPath,
 )
@@ -115,6 +115,13 @@ class PitchView(QGraphicsView):
         self._pan_drag = False
         self._pan_grab_frac = 0.0  # click position within the scrub thumb (0-1)
         self._scrub_rect = QRectF()
+        self._data_fmin = 50.0
+        self._data_fmax = 500.0
+        self._defer_pitch_range = False
+        self._pitch_range_timer = QTimer(self)
+        self._pitch_range_timer.setSingleShot(True)
+        self._pitch_range_timer.setInterval(120)
+        self._pitch_range_timer.timeout.connect(self._on_pitch_range_settled)
 
         self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         self.setMouseTracking(True)
@@ -130,6 +137,8 @@ class PitchView(QGraphicsView):
         self._times = times
         self._f0 = f0
         self._confidence = confidence
+        self._data_fmin = fmin
+        self._data_fmax = fmax
         self._fmin = fmin
         self._fmax = fmax
         self._duration = times[-1] if len(times) > 0 and times[-1] > 0 else len(f0) * (frame_dt(times))
@@ -138,6 +147,8 @@ class PitchView(QGraphicsView):
         self._selection_end = -1.0
         self._selection_rect.setRect(0, 0, 0, 0)
         self._view_offset = 0.0
+        self._defer_pitch_range = False
+        self._pitch_range_timer.stop()
         self._redraw()
 
     def default_zoom_index(self) -> int:
@@ -157,6 +168,8 @@ class PitchView(QGraphicsView):
     def set_zoom(self, zoom: float):
         self._zoom = max(zoom, 0.05)
         self._clamp_offset()
+        self._defer_pitch_range = False
+        self._pitch_range_timer.stop()
         self._redraw()
 
     def set_zoom_to_range(self, t0: float, t1: float):
@@ -184,6 +197,8 @@ class PitchView(QGraphicsView):
         self._view_offset = t0
         self._zoom = self._duration / span
         self._clamp_offset()
+        self._defer_pitch_range = False
+        self._pitch_range_timer.stop()
         self._redraw()
         if self._parent is not None and hasattr(self._parent, "_on_custom_zoom"):
             self._parent._on_custom_zoom(self._zoom)
@@ -250,8 +265,71 @@ class PitchView(QGraphicsView):
         if abs(new_offset - self._view_offset) < 1e-6:
             return False
         self._view_offset = new_offset
+        self._schedule_pitch_range_refresh()
         self._redraw()
         return True
+
+    def _visible_window(self) -> tuple[float, float]:
+        win = self._duration / self._zoom if self._zoom > 0 else self._duration
+        return self._view_offset, self._view_offset + win
+
+    def _visible_pitch_range(self) -> tuple[float, float] | None:
+        """Voiced F0 min/max inside the current time window, or None if silent/empty."""
+        if self._times is None or self._f0 is None or self._confidence is None:
+            return None
+        if len(self._times) == 0:
+            return None
+        t0, t1 = self._visible_window()
+        # Include a small edge sample so clipped notes at the boundary still count.
+        mask = (
+            (self._times >= t0 - 1e-9)
+            & (self._times <= t1 + 1e-9)
+            & ~np.isnan(self._f0)
+            & (self._confidence > 0.05)
+        )
+        if not mask.any():
+            return None
+        vals = self._f0[mask]
+        vals = vals[np.isfinite(vals) & (vals > 0)]
+        if vals.size == 0:
+            return None
+        return float(np.min(vals)), float(np.max(vals))
+
+    def _update_display_pitch_range(self):
+        """Set Y-axis bounds from the visible voiced range (with padding)."""
+        rng = self._visible_pitch_range()
+        if rng is None:
+            self._fmin = self._data_fmin
+            self._fmax = self._data_fmax
+            return
+        lo, hi = rng
+        midi_lo = _freq_to_midi(lo)
+        midi_hi = _freq_to_midi(hi)
+        if midi_hi - midi_lo < 0.25:
+            center = (midi_lo + midi_hi) * 0.5
+            midi_lo, midi_hi = center - 1.0, center + 1.0
+        else:
+            pad = max(0.5, (midi_hi - midi_lo) * 0.08)
+            midi_lo -= pad
+            midi_hi += pad
+        self._fmin = max(_midi_to_freq(midi_lo), 20.0)
+        self._fmax = max(_midi_to_freq(midi_hi), self._fmin * 1.05)
+
+    def _schedule_pitch_range_refresh(self):
+        """Debounce Y-axis refit until panning settles (keeps scrub drag cheap)."""
+        if self._pan_drag:
+            self._defer_pitch_range = True
+            return
+        self._pitch_range_timer.start()
+
+    def _on_pitch_range_settled(self):
+        self._defer_pitch_range = False
+        if self._times is None:
+            return
+        before = (self._fmin, self._fmax)
+        self._update_display_pitch_range()
+        if abs(before[0] - self._fmin) > 1e-6 or abs(before[1] - self._fmax) > 1e-6:
+            self._redraw()
 
     def _freq_to_y(self, f: float) -> float:
         vr = self._view_rect()
@@ -289,6 +367,11 @@ class PitchView(QGraphicsView):
         self._clamp_offset()
         vr = self._view_rect()
         self._bg_rect.setRect(vr)
+
+        # Y-axis follows the visible voiced range, unless a scrub is mid-drag
+        # (then keep the last settled bounds and refit after the user pauses).
+        if not self._defer_pitch_range:
+            self._update_display_pitch_range()
 
         # The purge above also removed the selection rect; put it back so the
         # highlight stays visible after zoom / data changes.
@@ -548,6 +631,7 @@ class PitchView(QGraphicsView):
             frac = max(0.0, min(1.0, (pos.x() - bar.left() - thumb_w * self._pan_grab_frac) / usable))
         self._view_offset = frac * (self._duration - win)
         self._clamp_offset()
+        self._schedule_pitch_range_refresh()
         self._redraw()
 
     def mouseMoveEvent(self, event):
@@ -589,6 +673,8 @@ class PitchView(QGraphicsView):
     def mouseReleaseEvent(self, event):
         if self._pan_drag:
             self._pan_drag = False
+            # Refit Y-axis once the scrub settles.
+            self._schedule_pitch_range_refresh()
             return
 
         if self._dragging_zoom:
@@ -648,6 +734,7 @@ class PitchView(QGraphicsView):
                 else:
                     self._view_offset += shift
                 self._clamp_offset()
+                self._schedule_pitch_range_refresh()
                 self._redraw()
                 event.accept()
                 return
