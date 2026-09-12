@@ -401,7 +401,8 @@ class MainWindow(QMainWindow):
         self._doc = doc
         self._pv.set_data(doc.times, doc.f0, doc.confidence, doc.fmin, doc.fmax)
         self._pv.set_title(doc.title)
-        self._zoom_to_index(2)
+        # Default to a readable partial window; full clip is still one zoom-out away.
+        self._zoom_to_index(self._pv.default_zoom_index())
         duration = len(doc.audio) / doc.sr
         self.statusBar().showMessage(f"已加载: {doc.title}  |  时长: {duration:.2f}s  |  采样率: {doc.sr}")
 

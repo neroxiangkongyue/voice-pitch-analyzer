@@ -48,6 +48,13 @@ def _note_name(midi: int) -> str:
 # Unvoiced stretches longer than this are not drawn at all (only short gaps
 # between voiced parts keep the dashed baseline marker).
 SILENT_HIDE_S = 1.0
+# Break the voiced pitch polyline when consecutive voiced samples are farther
+# apart than this — multi-second silences must not get a diagonal bridge line.
+VOICED_GAP_BREAK_S = 0.3
+# Default visible time window when a clip is longer than this (seconds).
+DEFAULT_VIEW_SECONDS = 20.0
+# Preferred zoom ladder (matches main-window slider).
+ZOOM_STEPS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
 
 
 class PitchView(QGraphicsView):
@@ -71,6 +78,11 @@ class PitchView(QGraphicsView):
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Scene coordinates map 1:1 to viewport pixels; pan/zoom is custom.
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._last_viewport_size = None
 
         self._bg_rect = self._scene.addRect(0, 0, 1, 1)
         self._bg_rect.setBrush(QBrush(QColor(245, 245, 245)))
@@ -100,6 +112,9 @@ class PitchView(QGraphicsView):
         self._zoom_start_x = 0.0
         self._edge_drag: str | None = None  # "start" | "end" while adjusting
         self._EDGE_PX = 6  # grab width of a selection edge
+        self._pan_drag = False
+        self._pan_grab_frac = 0.0  # click position within the scrub thumb (0-1)
+        self._scrub_rect = QRectF()
 
         self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         self.setMouseTracking(True)
@@ -125,6 +140,16 @@ class PitchView(QGraphicsView):
         self._view_offset = 0.0
         self._redraw()
 
+    def default_zoom_index(self) -> int:
+        """Zoom ladder index that shows a readable slice, not the full clip."""
+        if self._duration <= DEFAULT_VIEW_SECONDS:
+            return ZOOM_STEPS.index(1.0)
+        needed = self._duration / DEFAULT_VIEW_SECONDS
+        for i, z in enumerate(ZOOM_STEPS):
+            if z >= needed - 1e-9:
+                return i
+        return len(ZOOM_STEPS) - 1
+
     def set_title(self, title: str):
         self._title = title
         self._title_item.setPlainText(title)
@@ -148,8 +173,9 @@ class PitchView(QGraphicsView):
         margin_left = 60
         margin_top = 30
         margin_right = 20
-        margin_bottom = 30
-        return QRectF(margin_left, margin_top, w - margin_left - margin_right, h - margin_top - margin_bottom)
+        # Extra room under the time labels for the pan scrubber.
+        margin_bottom = 48
+        return QRectF(margin_left, margin_top, max(w - margin_left - margin_right, 1), max(h - margin_top - margin_bottom, 1))
 
     def _time_to_x(self, t: float) -> float:
         vr = self._view_rect()
@@ -196,7 +222,24 @@ class PitchView(QGraphicsView):
         ratio = (f - self._fmin) / (self._fmax - self._fmin)
         return vr.bottom() - ratio * vr.height()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        size = self.viewport().size()
+        if size != self._last_viewport_size:
+            self._last_viewport_size = size
+            self._sync_scene_to_viewport()
+            if self._times is not None:
+                self._redraw()
+
+    def _sync_scene_to_viewport(self):
+        """Keep scene rect equal to the widget viewport so time/pitch map 1:1 to pixels."""
+        vp = self.viewport()
+        w = max(vp.width(), 1)
+        h = max(vp.height(), 1)
+        self.setSceneRect(0, 0, w, h)
+
     def _redraw(self):
+        self._sync_scene_to_viewport()
         for item in self._scene.items():
             if item is not self._bg_rect and item is not self._title_item:
                 self._scene.removeItem(item)
@@ -214,16 +257,17 @@ class PitchView(QGraphicsView):
         self._scene.addItem(self._selection_rect)
 
         win = self._duration / self._zoom
-        if self._view_offset > 0:
-            label_text = f"显示: {self._view_offset:.1f}s - {self._view_offset + win:.1f}s"
+        if win < self._duration - 1e-9:
+            label_text = f"显示: {self._view_offset:.1f}s - {self._view_offset + win:.1f}s / {self._duration:.1f}s"
         else:
             label_text = f"显示范围: {win:.1f}s"
         self._time_label.setPlainText(label_text)
-        self._time_label.setPos(vr.right() - 130, vr.bottom() + 5)
+        self._time_label.setPos(vr.right() - 160, vr.bottom() + 5)
         self._scene.addItem(self._time_label)
 
         self._draw_grid(vr)
         self._draw_pitch_curve(vr)
+        self._draw_scrubber(vr)
 
         if self._selection_start >= 0 and self._selection_end >= 0:
             x1 = self._time_to_x(self._selection_start)
@@ -238,25 +282,50 @@ class PitchView(QGraphicsView):
 
         self._update_playhead()
 
+    def _time_tick_step(self, vr: QRectF) -> float:
+        """Pick a nice time step so ticks keep ~70px spacing on screen."""
+        win = self._duration / self._zoom
+        width = max(vr.width(), 1.0)
+        if win <= 0:
+            return 1.0
+        raw = win * 70.0 / width
+        candidates = (
+            0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5,
+            1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800,
+        )
+        for s in candidates:
+            if s >= raw:
+                return float(s)
+        return float(candidates[-1])
+
+    @staticmethod
+    def _format_time_label(t: float, step: float) -> str:
+        if t >= 60 and step >= 1:
+            minutes = int(t // 60)
+            secs = t - minutes * 60
+            return f"{minutes}:{secs:04.1f}"
+        if step < 1:
+            return f"{t:.2f}s"
+        if step < 10:
+            return f"{t:.1f}s"
+        return f"{t:.0f}s"
+
     def _draw_grid(self, vr: QRectF):
-        step = 1.0
-        if self._zoom >= 4:
-            step = 0.1
-        elif self._zoom >= 2:
-            step = 0.5
+        step = self._time_tick_step(vr)
 
         win = self._duration / self._zoom
-        t0 = math.floor(self._view_offset / step) * step
-        x = t0
-        while x <= self._view_offset + win + step:
+        t_end = self._view_offset + win
+        i0 = math.floor(self._view_offset / step + 1e-9)
+        i1 = math.ceil(t_end / step - 1e-9)
+        for i in range(i0, i1 + 1):
+            x = i * step
             px = self._time_to_x(x)
             if vr.left() <= px <= vr.right():
                 line = self._scene.addLine(px, vr.top(), px, vr.bottom())
                 line.setPen(QPen(QColor(220, 220, 220), 0.5))
-                label = self._scene.addText(f"{x:.1f}s")
+                label = self._scene.addText(self._format_time_label(x, step))
                 label.setFont(QFont("Consolas", 7))
                 label.setPos(px - 15, vr.bottom() + 2)
-            x += step
 
         # Pitch grid: one line per semitone (A4 = 440 Hz), labeled with note
         # names. Label density adapts to the pixel spacing so labels never
@@ -310,6 +379,31 @@ class PitchView(QGraphicsView):
         item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         return item
 
+    def _draw_scrubber(self, vr: QRectF):
+        """Horizontal overview bar: drag to pan when only part of the clip is shown."""
+        if self._duration <= 0:
+            self._scrub_rect = QRectF()
+            return
+
+        bar_h = 10.0
+        bar_y = float(self.viewport().height()) - 14.0
+        bar = QRectF(vr.left(), bar_y, vr.width(), bar_h)
+        self._scrub_rect = bar
+
+        track = self._scene.addRect(bar)
+        track.setBrush(QBrush(QColor(236, 240, 241)))
+        track.setPen(QPen(QColor(189, 195, 199), 0.5))
+
+        win = self._duration / self._zoom
+        if win >= self._duration - 1e-9:
+            return  # full clip visible — no thumb needed
+
+        thumb_w = max(24.0, bar.width() * (win / self._duration))
+        thumb_x = bar.left() + (bar.width() - thumb_w) * (self._view_offset / max(self._duration - win, 1e-9))
+        thumb = self._scene.addRect(QRectF(thumb_x, bar_y, thumb_w, bar_h))
+        thumb.setBrush(QBrush(QColor(52, 152, 219, 180)))
+        thumb.setPen(QPen(QColor(41, 128, 185), 1))
+
     def _draw_pitch_curve(self, vr: QRectF):
         if self._f0 is None:
             return
@@ -318,12 +412,22 @@ class PitchView(QGraphicsView):
         unvoiced_mask = ~voiced_mask
 
         if voiced_mask.any():
-            vx = self._time_to_x(self._times[voiced_mask])
-            vy = self._freq_to_y(self._f0[voiced_mask])
-            points = [QPointF(float(x), float(y)) for x, y in zip(vx, vy)]
-            item = self._polyline_item(points, QPen(QColor(41, 128, 185), 1.5), vr)
-            self._scene.addItem(item)
-            self._pitch_items.append(item)
+            v_idx = np.flatnonzero(voiced_mask)
+            t_v = self._times[v_idx]
+            if v_idx.size == 1:
+                segs = [v_idx]
+            else:
+                breaks = np.flatnonzero(np.diff(t_v) > VOICED_GAP_BREAK_S)
+                segs = np.split(v_idx, breaks + 1)
+            for seg in segs:
+                if seg.size < 2:
+                    continue
+                vx = self._time_to_x(self._times[seg])
+                vy = self._freq_to_y(self._f0[seg])
+                points = [QPointF(float(x), float(y)) for x, y in zip(vx, vy)]
+                item = self._polyline_item(points, QPen(QColor(41, 128, 185), 1.5), vr)
+                self._scene.addItem(item)
+                self._pitch_items.append(item)
 
         if unvoiced_mask.any():
             # Hide the unvoiced dash line for long silent stretches (>= 1 s):
@@ -361,32 +465,64 @@ class PitchView(QGraphicsView):
             self._scene.removeItem(self._playhead_line)
 
     def mousePressEvent(self, event):
+        pos = event.position()
         if event.button() == Qt.MouseButton.LeftButton and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             self._dragging_zoom = True
-            self._zoom_start_x = event.position().x()
+            self._zoom_start_x = pos.x()
             self.viewport().setCursor(Qt.CursorShape.SizeHorCursor)
+        elif event.button() == Qt.MouseButton.LeftButton and self._scrubber_hit(pos):
+            self._pan_from_scrubber(pos, start_drag=True)
+            event.accept()
+            return
         elif event.button() == Qt.MouseButton.LeftButton:
-            edge = self._edge_hit_test(event.position().x())
+            edge = self._edge_hit_test(pos.x())
             if edge:
                 self._edge_drag = edge
                 self.viewport().setCursor(Qt.CursorShape.SizeHorCursor)
             else:
                 self._selecting = True
-                self._select_start_x = event.position().x()
+                self._select_start_x = pos.x()
                 self._selection_rect.setRect(0, 0, 0, 0)
         elif event.button() == Qt.MouseButton.RightButton:
             self._show_context_menu(event)
         super().mousePressEvent(event)
 
+    def _scrubber_hit(self, pos) -> bool:
+        return self._scrub_rect.isValid() and self._scrub_rect.adjusted(0, -4, 0, 4).contains(pos)
+
+    def _pan_from_scrubber(self, pos, start_drag: bool = False) -> None:
+        """Map an x-position on the scrubber to view_offset; optional drag start."""
+        if self._duration <= 0 or self._scrub_rect.width() <= 0:
+            return
+        win = self._duration / self._zoom
+        if win >= self._duration - 1e-9:
+            return
+        bar = self._scrub_rect
+        thumb_w = max(24.0, bar.width() * (win / self._duration))
+        usable = max(bar.width() - thumb_w, 1.0)
+        frac = max(0.0, min(1.0, (pos.x() - bar.left() - thumb_w * 0.5) / usable))
+        if start_drag:
+            # Keep the grab point inside the thumb so the bar doesn't jump.
+            thumb_x = bar.left() + usable * (self._view_offset / (self._duration - win))
+            local = (pos.x() - thumb_x) / thumb_w
+            self._pan_grab_frac = max(0.0, min(1.0, local))
+            self._pan_drag = True
+            frac = max(0.0, min(1.0, (pos.x() - bar.left() - thumb_w * self._pan_grab_frac) / usable))
+        self._view_offset = frac * (self._duration - win)
+        self._clamp_offset()
+        self._redraw()
+
     def mouseMoveEvent(self, event):
+        if self._pan_drag:
+            self._pan_from_scrubber(event.position())
+            return
         if self._dragging_zoom:
             dx = event.position().x() - self._zoom_start_x
             scale = 1.0 + dx / 300.0
             scale = max(0.5, min(2.0, scale))
-            steps = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
-            nearest = min(steps, key=lambda s: abs(s - self._zoom * scale))
+            nearest = min(ZOOM_STEPS, key=lambda s: abs(s - self._zoom * scale))
             if self._parent is not None:
-                self._parent._zoom_to_index(steps.index(nearest))
+                self._parent._zoom_to_index(ZOOM_STEPS.index(nearest))
             return
 
         if self._edge_drag:
@@ -413,6 +549,10 @@ class PitchView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._pan_drag:
+            self._pan_drag = False
+            return
+
         if self._dragging_zoom:
             self._dragging_zoom = False
             self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
@@ -450,8 +590,8 @@ class PitchView(QGraphicsView):
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            steps = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
-            cur = steps.index(self._zoom) if self._zoom in steps else 2
+            steps = list(ZOOM_STEPS)
+            cur = steps.index(self._zoom) if self._zoom in steps else steps.index(1.0)
             if event.angleDelta().y() > 0:
                 cur = min(cur + 1, len(steps) - 1)
             else:
