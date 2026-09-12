@@ -89,6 +89,7 @@ class MainWindow(QMainWindow):
         self._docs: list[AudioDocument] = []
         self._placeholder_active = True
         self._recording_counter = 0
+        self._record_anchor = 0.0  # timeline offset where the next recording lands
 
         self._recorder = AudioRecorder()
         self._player = AudioPlayer()
@@ -399,6 +400,7 @@ class MainWindow(QMainWindow):
     def _activate_document(self, doc: AudioDocument):
         self._stop_playback()
         self._doc = doc
+        # set_data clears overlays — switching files drops previous takes.
         self._pv.set_data(doc.times, doc.f0, doc.confidence, doc.fmin, doc.fmax)
         self._pv.set_title(doc.title)
         # Default to a readable partial window; full clip is still one zoom-out away.
@@ -414,14 +416,26 @@ class MainWindow(QMainWindow):
 
     # ── Recording ─────────────────────────────────────────────────
 
+    def _marker_time(self) -> float:
+        """Timeline position of the single-click marker / selection start, or 0."""
+        if self._pv is None:
+            return 0.0
+        start = self._pv.selection_start_time()
+        if start is None or start < 0:
+            return 0.0
+        return float(start)
+
     @Slot()
     def _on_toggle_record(self):
         if not self._recorder.is_recording:
+            # Overlay recordings start at the clicked marker on the current curve.
+            self._record_anchor = self._marker_time() if self._doc is not None else 0.0
             try:
                 dev = self._recorder.get_default_device()
                 self._recorder.start()
                 self._record_btn.setText("停止录音")
-                self.statusBar().showMessage(f"录音中... 设备: {dev}")
+                anchor_txt = f"{self._record_anchor:.2f}s" if self._doc is not None else "新文档"
+                self.statusBar().showMessage(f"录音中... 设备: {dev} | 落点: {anchor_txt}")
             except Exception as e:
                 QMessageBox.critical(self, "录音失败", f"无法启动录音: {e}")
         else:
@@ -432,10 +446,23 @@ class MainWindow(QMainWindow):
                 return
             try:
                 times, f0, confidence = extract_pitch(audio, sr)
-                fmin, fmax = detect_frequency_range(f0, len(audio) / sr)
             except Exception as e:
                 QMessageBox.critical(self, "分析失败", str(e))
                 return
+
+            # With a base clip loaded: draw the take as a yellow overlay at the marker.
+            if self._doc is not None:
+                times = np.asarray(times, dtype=float) + self._record_anchor
+                self._pv.add_overlay(times, f0, confidence)
+                self._recording_counter += 1
+                self.statusBar().showMessage(
+                    f"录音已叠加 (黄) @ {self._record_anchor:.2f}s，时长 {len(audio) / sr:.2f}s"
+                    f" | 叠加 #{self._recording_counter}"
+                )
+                return
+
+            # No base document yet: keep the old standalone-recording behaviour.
+            fmin, fmax = detect_frequency_range(f0, len(audio) / sr)
             self._recording_counter += 1
             self._add_document(AudioDocument(
                 title=f"[录音 {self._recording_counter}]", audio=audio, sr=sr,

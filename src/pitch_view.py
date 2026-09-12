@@ -103,6 +103,8 @@ class PitchView(QGraphicsView):
         self._selection_rect.setPen(QPen(QColor(52, 152, 219), 1))
 
         self._pitch_items: list = []
+        # Overlay pitch curves (e.g. live recordings) drawn on top of the base.
+        self._overlays: list[dict] = []
 
         self._selection_start = -1.0
         self._selection_end = -1.0
@@ -147,6 +149,37 @@ class PitchView(QGraphicsView):
         self._selection_end = -1.0
         self._selection_rect.setRect(0, 0, 0, 0)
         self._view_offset = 0.0
+        self._defer_pitch_range = False
+        self._pitch_range_timer.stop()
+        self._overlays.clear()
+        self._redraw()
+
+    def clear_overlays(self):
+        if not self._overlays:
+            return
+        self._overlays.clear()
+        self._redraw()
+
+    def add_overlay(
+        self,
+        times: np.ndarray,
+        f0: np.ndarray,
+        confidence: np.ndarray,
+        color: QColor | None = None,
+    ):
+        """Stack an extra pitch curve (absolute timeline) on the current base."""
+        if times is None or len(times) == 0:
+            return
+        self._overlays.append({
+            "times": np.asarray(times, dtype=float),
+            "f0": np.asarray(f0, dtype=float),
+            "confidence": np.asarray(confidence, dtype=float),
+            "color": color or QColor(255, 230, 0),
+        })
+        # Recording may run past the base clip; grow the timeline so it stays visible.
+        t_end = float(self._overlays[-1]["times"][-1])
+        if t_end > self._duration:
+            self._duration = t_end
         self._defer_pitch_range = False
         self._pitch_range_timer.stop()
         self._redraw()
@@ -275,22 +308,29 @@ class PitchView(QGraphicsView):
 
     def _visible_pitch_range(self) -> tuple[float, float] | None:
         """Voiced F0 min/max inside the current time window, or None if silent/empty."""
-        if self._times is None or self._f0 is None or self._confidence is None:
-            return None
-        if len(self._times) == 0:
-            return None
         t0, t1 = self._visible_window()
-        # Include a small edge sample so clipped notes at the boundary still count.
-        mask = (
-            (self._times >= t0 - 1e-9)
-            & (self._times <= t1 + 1e-9)
-            & ~np.isnan(self._f0)
-            & (self._confidence > 0.05)
-        )
-        if not mask.any():
+        chunks: list[np.ndarray] = []
+
+        def _collect(times, f0, conf):
+            if times is None or f0 is None or conf is None or len(times) == 0:
+                return
+            mask = (
+                (times >= t0 - 1e-9)
+                & (times <= t1 + 1e-9)
+                & ~np.isnan(f0)
+                & (conf > 0.05)
+            )
+            if mask.any():
+                vals = f0[mask]
+                chunks.append(vals[np.isfinite(vals) & (vals > 0)])
+
+        _collect(self._times, self._f0, self._confidence)
+        for ov in self._overlays:
+            _collect(ov["times"], ov["f0"], ov["confidence"])
+
+        if not chunks:
             return None
-        vals = self._f0[mask]
-        vals = vals[np.isfinite(vals) & (vals > 0)]
+        vals = np.concatenate(chunks)
         if vals.size == 0:
             return None
         return float(np.min(vals)), float(np.max(vals))
@@ -388,6 +428,7 @@ class PitchView(QGraphicsView):
 
         self._draw_grid(vr)
         self._draw_pitch_curve(vr)
+        self._draw_overlays(vr)
         self._draw_scrubber(vr)
 
         if self._selection_start >= 0 and self._selection_end >= 0:
@@ -525,31 +566,54 @@ class PitchView(QGraphicsView):
         thumb.setBrush(QBrush(QColor(52, 152, 219, 180)))
         thumb.setPen(QPen(QColor(41, 128, 185), 1))
 
+    def _draw_voiced_segments(
+        self,
+        vr: QRectF,
+        times: np.ndarray,
+        f0: np.ndarray,
+        confidence: np.ndarray,
+        color: QColor,
+        width: float = 1.5,
+    ):
+        voiced_mask = ~np.isnan(f0) & (confidence > 0.05)
+        if not voiced_mask.any():
+            return
+        v_idx = np.flatnonzero(voiced_mask)
+        t_v = times[v_idx]
+        if v_idx.size == 1:
+            segs = [v_idx]
+        else:
+            breaks = np.flatnonzero(np.diff(t_v) > VOICED_GAP_BREAK_S)
+            segs = np.split(v_idx, breaks + 1)
+        pen = QPen(color, width)
+        for seg in segs:
+            if seg.size < 2:
+                continue
+            vx = self._time_to_x(times[seg])
+            vy = self._freq_to_y(f0[seg])
+            points = [QPointF(float(x), float(y)) for x, y in zip(vx, vy)]
+            item = self._polyline_item(points, pen, vr)
+            self._scene.addItem(item)
+            self._pitch_items.append(item)
+
+    def _draw_overlays(self, vr: QRectF):
+        for ov in self._overlays:
+            self._draw_voiced_segments(
+                vr, ov["times"], ov["f0"], ov["confidence"],
+                ov["color"], width=2.0,
+            )
+
     def _draw_pitch_curve(self, vr: QRectF):
         if self._f0 is None:
             return
 
+        self._draw_voiced_segments(
+            vr, self._times, self._f0, self._confidence,
+            QColor(41, 128, 185), width=1.5,
+        )
+
         voiced_mask = ~np.isnan(self._f0) & (self._confidence > 0.05)
         unvoiced_mask = ~voiced_mask
-
-        if voiced_mask.any():
-            v_idx = np.flatnonzero(voiced_mask)
-            t_v = self._times[v_idx]
-            if v_idx.size == 1:
-                segs = [v_idx]
-            else:
-                breaks = np.flatnonzero(np.diff(t_v) > VOICED_GAP_BREAK_S)
-                segs = np.split(v_idx, breaks + 1)
-            for seg in segs:
-                if seg.size < 2:
-                    continue
-                vx = self._time_to_x(self._times[seg])
-                vy = self._freq_to_y(self._f0[seg])
-                points = [QPointF(float(x), float(y)) for x, y in zip(vx, vy)]
-                item = self._polyline_item(points, QPen(QColor(41, 128, 185), 1.5), vr)
-                self._scene.addItem(item)
-                self._pitch_items.append(item)
-
         if unvoiced_mask.any():
             # Hide the unvoiced dash line for long silent stretches (>= 1 s):
             # only short gaps stay marked so the baseline reads as "brief gaps",
