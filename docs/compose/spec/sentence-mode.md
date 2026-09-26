@@ -1,14 +1,20 @@
 ---
 feature: sentence-mode
-status: designed
+status: delivered
 updated: 2025-01-01
 branch: feat/sentence-mode
-commits: 
+commits: a629b0c..038d0f1
 ---
 
 # 单句模式
 
 ## Report
+
+**What was built** — 在音高曲线上常开「按句」操作：左键单击会选中所在整句（句界按发声间隙约 0.45s 切分，短碎句并入邻句，两端带 lead-in/tail），选区语义与拖拽框选一致，因此播放、右键菜单、缩放到选区直接复用。工具栏增加「上一句 / 下一句」，在句列表间跳转并滚动到可见位置。句分割落在纯模块 `src/sentences.py`，PitchView 在 `set_data` 时缓存句列表。
+
+**Verification** — `pixi run python -m tests.test_sentences`（7 passed）；offscreen 冒烟：3 句合成轨道能正确 `select_sentence_at` / `adjacent_sentence` 并夹紧首尾。
+
+**Journey log** — 环境阻止 `git worktree add`，改为在 `feat/sentence-mode` 分支原地开发并 push 远端；审查子代理超时取消，以单测 + 冒烟与人工核对合并边界收尾。
 
 ## [S1] Problem
 
@@ -37,7 +43,7 @@ commits:
 
 ### 接口
 
-- `PitchView.set_sentences(list[tuple[float,float]])` / 在 `set_data` 内自动 `segment_sentences`。
+- `PitchView.set_sentences` 不单独暴露；`set_data` 内调用 `segment_sentences` 缓存于 `_sentences`。
 - `PitchView.select_sentence_at(t: float) -> bool`
 - `PitchView.adjacent_sentence(delta: int) -> bool`（+1 下一句，-1 上一句），成功时更新选区并 emit `selection_changed`。
 - MainWindow 工具栏按钮连接上述方法。
@@ -51,7 +57,7 @@ commits:
 
 ## Tasks
 
-- [ ] T1: 实现 `segment_sentences` 纯函数与单元测试 — acceptance: 静音切句、短碎合并、首尾 padding 可用测试断言 (covers: S2)
-- [ ] T2: PitchView 单击选句 + 上/下一句 API — acceptance: 单击选中整句，拖拽仍手动框选，adjacent 可在句间移动 (covers: S2; depends: T1)
-- [ ] T3: 工具栏「上一句/下一句」按钮与播放闭环 — acceptance: 点击按钮选区跳句，播放按钮播当前句 (covers: S2; depends: T2)
-- [ ] T4: 回归验证与文档 — acceptance: 旧单击标记/拖拽/录音叠加不回归，相关行为写入 docs/usage.md (covers: S2; depends: T2, T3)
+- [x] T1: 实现 `segment_sentences` 纯函数与单元测试 — acceptance: 静音切句、短碎合并、首尾 padding 可用测试断言 (covers: S2)
+- [x] T2: PitchView 单击选句 + 上/下一句 API — acceptance: 单击选中整句，拖拽仍手动框选，adjacent 可在句间移动 (covers: S2; depends: T1)
+- [x] T3: 工具栏「上一句/下一句」按钮与播放闭环 — acceptance: 点击按钮选区跳句，播放按钮播当前句 (covers: S2; depends: T2)
+- [x] T4: 回归验证与文档 — acceptance: 旧单击标记/拖拽/录音叠加不回归，相关行为写入 docs/usage.md (covers: S2; depends: T2, T3)
