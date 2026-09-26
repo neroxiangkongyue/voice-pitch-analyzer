@@ -12,14 +12,16 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QSlider, QGroupBox, QStyleFactory,
     QMessageBox, QListWidget, QListWidgetItem, QSizePolicy,
-    QToolBar, QSplitter, QProgressDialog,
+    QToolBar, QSplitter, QProgressDialog, QDoubleSpinBox,
 )
+from PySide6.QtCore import QSettings
 
 from src.audio_loader import load_audio
 from src.pitch_detector import extract_pitch, extract_pitch_cached, detect_frequency_range
 from src.audio_recorder import AudioRecorder
 from src.audio_player import AudioPlayer
 from src.pitch_view import PitchView
+from src.pitch_shift import semitone_ratio, shift_audio
 
 
 SUPPORTED_EXTS = "Audio Files (*.wav *.mp3 *.flac *.m4a *.aac *.ogg);;All Files (*)"
@@ -106,8 +108,14 @@ class MainWindow(QMainWindow):
         self._current_zoom = 1.0
         self._zoom_steps = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
         self._loop_enabled = False
+        self._settings = QSettings("VoicePitchAnalyzer", "pitch-shift")
+        self._pitch_shift_semitones = float(self._settings.value("semitone", 0.0, type=float))
+        # Cache of pitch-shifted audio for the active document.
+        self._shifted_audio_cache: tuple[int, float, np.ndarray] | None = None
 
         self._build_ui()
+        if hasattr(self, "_pv"):
+            self._pv.set_pitch_shift(self._pitch_shift_semitones)
 
         # Warm up the pitch-analysis pipeline (librosa/numba JIT) in the
         # background so opening the first file is not slowed down by
@@ -262,6 +270,21 @@ class MainWindow(QMainWindow):
         self._zoom_slider.valueChanged.connect(self._on_zoom_slider)
         ctrl_layout.addWidget(QLabel("缩放:"))
         ctrl_layout.addWidget(self._zoom_slider)
+        ctrl_layout.addStretch()
+
+        ctrl_layout.addWidget(QLabel("变调(半音):"))
+        self._pitch_spin = QDoubleSpinBox()
+        self._pitch_spin.setRange(-12.0, 12.0)
+        self._pitch_spin.setSingleStep(0.5)
+        self._pitch_spin.setDecimals(1)
+        self._pitch_spin.setSuffix(" st")
+        self._pitch_spin.setValue(self._pitch_shift_semitones)
+        self._pitch_spin.setFixedWidth(90)
+        self._pitch_spin.valueChanged.connect(self._on_pitch_shift_changed)
+        ctrl_layout.addWidget(self._pitch_spin)
+        self._pitch_ratio_label = QLabel(self._ratio_text(self._pitch_shift_semitones))
+        self._pitch_ratio_label.setFixedWidth(64)
+        ctrl_layout.addWidget(self._pitch_ratio_label)
         ctrl_layout.addStretch()
 
         self._playback_pos = QLabel("0.000s")
@@ -424,6 +447,7 @@ class MainWindow(QMainWindow):
         self._zoom_to_index(self._pv.default_zoom_index())
         # Skip leading silence once the window size is known.
         self._pv.focus_first_voiced()
+        self._shifted_audio_cache = None
         duration = len(doc.audio) / doc.sr
         self.statusBar().showMessage(f"已加载: {doc.title}  |  时长: {duration:.2f}s  |  采样率: {doc.sr}")
 
@@ -525,13 +549,50 @@ class MainWindow(QMainWindow):
                 end = None
             self._start_playback(start, end)
 
+    @staticmethod
+    def _ratio_text(semitones: float) -> str:
+        return f"×{semitone_ratio(semitones):.3f}"
+
+    def _on_pitch_shift_changed(self, value: float):
+        self._pitch_shift_semitones = float(value)
+        self._settings.setValue("semitone", self._pitch_shift_semitones)
+        self._settings.sync()
+        self._shifted_audio_cache = None
+        self._pitch_ratio_label.setText(self._ratio_text(self._pitch_shift_semitones))
+        if hasattr(self, "_pv"):
+            self._pv.set_pitch_shift(self._pitch_shift_semitones)
+        self.statusBar().showMessage(
+            f"变调 {self._pitch_shift_semitones:+.1f} 半音 {self._ratio_text(self._pitch_shift_semitones)}"
+        )
+
+    def _playback_audio(self) -> tuple[np.ndarray, int]:
+        """Active document audio, pitch-shifted and cached for the current setting."""
+        doc = self._doc
+        if doc is None:
+            raise RuntimeError("no document")
+        cache_id = id(doc.audio)
+        if (
+            self._shifted_audio_cache is not None
+            and self._shifted_audio_cache[0] == cache_id
+            and abs(self._shifted_audio_cache[1] - self._pitch_shift_semitones) < 1e-9
+        ):
+            return self._shifted_audio_cache[2], doc.sr
+        audio = doc.audio
+        if abs(self._pitch_shift_semitones) > 1e-9:
+            audio = shift_audio(audio, doc.sr, self._pitch_shift_semitones)
+        else:
+            audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        self._shifted_audio_cache = (cache_id, self._pitch_shift_semitones, audio)
+        return audio, doc.sr
+
     def _start_playback(self, start: float, end: float | None = None):
         """Play [start, end) of the active document; end<=0 plays everything."""
         if self._doc is None:
             return
         try:
+            audio, sr = self._playback_audio()
             started = self._player.play(
-                self._doc.audio, self._doc.sr,
+                audio, sr,
                 start=max(0.0, start),
                 end=end if end and end > 0 else None,
                 loop=self._loop_enabled,

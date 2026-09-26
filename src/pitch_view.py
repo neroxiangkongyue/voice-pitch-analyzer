@@ -11,6 +11,7 @@ from PySide6.QtGui import (
     QPainter, QPen, QColor, QBrush, QFont, QCursor, QPolygonF, QPainterPath,
 )
 
+from src.pitch_shift import semitone_ratio, shift_f0
 from src.sentences import sentence_index_at, segment_sentences
 
 pg.setConfigOption("background", "w")
@@ -109,6 +110,7 @@ class PitchView(QGraphicsView):
         self._overlays: list[dict] = []
         self._sentences: list[tuple[float, float]] = []
         self._sentence_cursor = -1  # last selected sentence index
+        self._pitch_shift_semitones = 0.0
 
         self._selection_start = -1.0
         self._selection_end = -1.0
@@ -275,6 +277,19 @@ class PitchView(QGraphicsView):
         self._title = title
         self._title_item.setPlainText(title)
 
+    def set_pitch_shift(self, semitones: float):
+        """Display-time F0 scale; analysis stays on the original audio."""
+        self._pitch_shift_semitones = float(semitones)
+        self._defer_pitch_range = False
+        self._pitch_range_timer.stop()
+        self._redraw()
+
+    def pitch_shift_semitones(self) -> float:
+        return self._pitch_shift_semitones
+
+    def _display_f0(self, f0: np.ndarray) -> np.ndarray:
+        return shift_f0(f0, self._pitch_shift_semitones)
+
     def set_zoom(self, zoom: float):
         self._zoom = max(zoom, 0.05)
         self._clamp_offset()
@@ -398,7 +413,7 @@ class PitchView(QGraphicsView):
                 & (conf > 0.05)
             )
             if mask.any():
-                vals = f0[mask]
+                vals = self._display_f0(f0[mask])
                 chunks.append(vals[np.isfinite(vals) & (vals > 0)])
 
         _collect(self._times, self._f0, self._confidence)
@@ -416,8 +431,9 @@ class PitchView(QGraphicsView):
         """Set Y-axis bounds from the visible voiced range (with padding)."""
         rng = self._visible_pitch_range()
         if rng is None:
-            self._fmin = self._data_fmin
-            self._fmax = self._data_fmax
+            ratio = semitone_ratio(self._pitch_shift_semitones)
+            self._fmin = self._data_fmin * ratio
+            self._fmax = self._data_fmax * ratio
             return
         lo, hi = rng
         midi_lo = _freq_to_midi(lo)
@@ -676,7 +692,7 @@ class PitchView(QGraphicsView):
     def _draw_overlays(self, vr: QRectF):
         for ov in self._overlays:
             self._draw_voiced_segments(
-                vr, ov["times"], ov["f0"], ov["confidence"],
+                vr, ov["times"], self._display_f0(ov["f0"]), ov["confidence"],
                 ov["color"], width=2.0,
             )
 
@@ -685,7 +701,7 @@ class PitchView(QGraphicsView):
             return
 
         self._draw_voiced_segments(
-            vr, self._times, self._f0, self._confidence,
+            vr, self._times, self._display_f0(self._f0), self._confidence,
             QColor(41, 128, 185), width=1.5,
         )
 
@@ -988,6 +1004,8 @@ class PitchView(QGraphicsView):
         idx = int(np.searchsorted(self._times, t))
         idx = min(idx, len(self._times) - 1)
         f0 = float(self._f0[idx]) if self._f0 is not None and idx < len(self._f0) else float("nan")
+        if math.isfinite(f0):
+            f0 = f0 * semitone_ratio(self._pitch_shift_semitones)
         conf = float(self._confidence[idx]) if self._confidence is not None and idx < len(self._confidence) else 0.0
         if math.isfinite(f0) and conf > 0.05:
             midi = round(_freq_to_midi(f0))
