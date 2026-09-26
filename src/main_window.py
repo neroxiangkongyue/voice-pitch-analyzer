@@ -184,6 +184,18 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
+        self._prev_sentence_btn = QPushButton("上一句")
+        self._prev_sentence_btn.setFixedHeight(28)
+        self._prev_sentence_btn.clicked.connect(lambda: self._step_sentence(-1))
+        toolbar.addWidget(self._prev_sentence_btn)
+
+        self._next_sentence_btn = QPushButton("下一句")
+        self._next_sentence_btn.setFixedHeight(28)
+        self._next_sentence_btn.clicked.connect(lambda: self._step_sentence(1))
+        toolbar.addWidget(self._next_sentence_btn)
+
+        toolbar.addSeparator()
+
         self._play_btn = QPushButton("播放")
         self._play_btn.setFixedHeight(28)
         self._play_btn.clicked.connect(self._on_toggle_play)
@@ -486,6 +498,18 @@ class MainWindow(QMainWindow):
         self._pv.clear_overlays()
         self._recording_counter = 0
         self.statusBar().showMessage(f"已清空 {n} 条录音曲线")
+
+    @Slot()
+    def _step_sentence(self, delta: int):
+        if not hasattr(self, "_pv") or self._doc is None:
+            self.statusBar().showMessage("请先加载音频")
+            return
+        if not self._pv.adjacent_sentence(delta):
+            self.statusBar().showMessage("没有可用的句子")
+            return
+        s = self._pv.selection_start_time()
+        e = self._pv.selection_end_time()
+        self.statusBar().showMessage(f"句子: {s:.2f}s – {e:.2f}s")
 
     # ── Playback ──────────────────────────────────────────────────
 

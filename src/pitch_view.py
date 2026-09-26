@@ -11,6 +11,8 @@ from PySide6.QtGui import (
     QPainter, QPen, QColor, QBrush, QFont, QCursor, QPolygonF, QPainterPath,
 )
 
+from src.sentences import sentence_index_at, segment_sentences
+
 pg.setConfigOption("background", "w")
 pg.setConfigOption("foreground", "k")
 
@@ -105,6 +107,8 @@ class PitchView(QGraphicsView):
         self._pitch_items: list = []
         # Overlay pitch curves (e.g. live recordings) drawn on top of the base.
         self._overlays: list[dict] = []
+        self._sentences: list[tuple[float, float]] = []
+        self._sentence_cursor = -1  # last selected sentence index
 
         self._selection_start = -1.0
         self._selection_end = -1.0
@@ -152,7 +156,47 @@ class PitchView(QGraphicsView):
         self._defer_pitch_range = False
         self._pitch_range_timer.stop()
         self._overlays.clear()
+        self._sentences = segment_sentences(times, f0, confidence)
+        self._sentence_cursor = -1
         self._redraw()
+
+    def sentences(self) -> list[tuple[float, float]]:
+        return list(self._sentences)
+
+    def select_sentence_at(self, t: float) -> bool:
+        """Select the sentence containing t; False if none covers it."""
+        if not self._sentences:
+            return False
+        idx = sentence_index_at(self._sentences, t)
+        if idx < 0:
+            return False
+        return self._select_sentence_index(idx)
+
+    def _select_sentence_index(self, idx: int) -> bool:
+        if idx < 0 or idx >= len(self._sentences):
+            return False
+        self._sentence_cursor = idx
+        start, end = self._sentences[idx]
+        self._selection_start = start
+        self._selection_end = end
+        self._redraw()
+        self.selection_changed.emit(start, end)
+        return True
+
+    def adjacent_sentence(self, delta: int) -> bool:
+        """Move selection to the previous/next sentence (delta = -1 / +1)."""
+        if not self._sentences:
+            return False
+        if self._sentence_cursor < 0:
+            # No sentence selected yet: pick first / last by direction.
+            idx = 0 if delta >= 0 else len(self._sentences) - 1
+        else:
+            idx = self._sentence_cursor + delta
+            idx = max(0, min(len(self._sentences) - 1, idx))
+        ok = self._select_sentence_index(idx)
+        if ok:
+            self.ensure_visible((self._sentences[idx][0] + self._sentences[idx][1]) * 0.5)
+        return ok
 
     def first_voiced_time(self, lead_in: float = 0.15) -> float:
         """Start of the first confidently voiced frame, minus a small lead-in."""
@@ -798,14 +842,23 @@ class PitchView(QGraphicsView):
             t1 = min(self._duration, self._view_offset + frac1 * win)
             t2 = min(self._duration, self._view_offset + frac2 * win)
             if abs(x2 - x1) < 4:
-                # Plain click (no drag): drop a single-point marker line.
+                # Plain click: snap to the containing sentence when possible.
                 t = min(t1, t2)
-                self._selection_start = self._selection_end = t
+                if self.select_sentence_at(t):
+                    pass  # already selected + emitted
+                else:
+                    self._selection_start = self._selection_end = t
+                    self._sentence_cursor = -1
+                    self._redraw()
+                    self.selection_changed.emit(self._selection_start, self._selection_end)
             else:
                 self._selection_start = min(t1, t2)
                 self._selection_end = max(t1, t2)
-            self._redraw()
-            self.selection_changed.emit(self._selection_start, self._selection_end)
+                self._sentence_cursor = sentence_index_at(
+                    self._sentences, (self._selection_start + self._selection_end) * 0.5
+                )
+                self._redraw()
+                self.selection_changed.emit(self._selection_start, self._selection_end)
 
         super().mouseReleaseEvent(event)
 
@@ -882,6 +935,7 @@ class PitchView(QGraphicsView):
         self._selection_start = -1.0
         self._selection_end = -1.0
         self._selection_rect.setRect(0, 0, 0, 0)
+        self._sentence_cursor = -1
         self.selection_changed.emit(-1.0, -1.0)
 
     def nudge_selection(self, delta: float):
