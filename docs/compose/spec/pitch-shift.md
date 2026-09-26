@@ -1,14 +1,20 @@
 ---
 feature: pitch-shift
-status: in-progress
+status: delivered
 updated: 2025-01-01
 branch: feat/pitch-shift
-commits: 
+commits: a29cbb8..5c93692
 ---
 
 # 变调（Pitch Shift）
 
 ## Report
+
+**What was built** — 控制栏提供 **变调(半音)** 输入框（−12…+12，步长 0.5）。改值后曲线（含黄色录音叠加）、音名轴与悬停提示按 `2^(s/12)` 立即变化；播放用 `librosa.effects.pitch_shift` 重合成、时长不变，并按（文档, 半音）缓存。参数经 `QSettings` 持久化，重启恢复。分析缓存仍基于原始音频。
+
+**Verification** — `pixi run python -m tests.test_pitch_shift`（3 passed）；`tests.test_sentences`（7 passed，无回归）；offscreen：显示倍率 +12→×2、设置读写、播放缓存命中。
+
+**Journey log** — 相位声码器路径保持时长，与时间轴/句边界兼容。审查子代理两次超时，以单测+冒烟+diff 人工核对收尾。基于 `feat/pitch-mode` 叠分支（本机禁止 `git worktree add` / 切回 main）。
 
 ## [S1] Problem
 
@@ -34,16 +40,13 @@ commits:
 - 变调用 **librosa.effects.pitch_shift**（phase vocoder / 重合成，**不变速**），`n_steps=s`。
 - 对「当前文档音频」按 `(id(audio), s)` 缓存变换结果，同参数重复播放不重算；变调改动后重建缓存。
 - 播放选区/循环/播放头时间轴仍是原始时间（时长不变）。
-- 录音叠加黄线：曲线显示同样乘比例；叠加音频若单独播放（未来）再套用同一变换——本期仅文档播放路径。
+- 录音叠加黄线：曲线显示同样乘比例。
 
 ### 接口
 
-- `src/pitch_shift.py`：
-  - `semitone_ratio(s: float) -> float`
-  - `shift_f0(f0: np.ndarray, s: float) -> np.ndarray`
-  - `shift_audio(audio: np.ndarray, sr: int, s: float) -> np.ndarray`
-- `PitchView.set_pitch_shift(s: float)`：保存系数并 `_redraw()`。
-- MainWindow：控件 + `QSettings` 读写 + 播放缓存。
+- `src/pitch_shift.py`：`semitone_ratio` / `shift_f0` / `shift_audio`。
+- `PitchView.set_pitch_shift(s: float)`。
+- MainWindow：控件 + `QSettings` 读写 + `_playback_audio()` 缓存。
 
 ## [S3] Out of Scope
 
@@ -54,7 +57,7 @@ commits:
 
 ## Tasks
 
-- [ ] T1: `pitch_shift` 纯函数 + 单测 — acceptance: ratio/shift_f0/shift_audio 时长不变、频谱移调可断言 (covers: S2)
-- [ ] T2: PitchView 曲线/音名/悬停随半音变化 — acceptance: set_pitch_shift 后 F0 显示与纵轴按比例变化 (covers: S2; depends: T1)
-- [ ] T3: 播放变调 + 缓存 — acceptance: 播放听到变调且时长不变，同参数二次播放不重复计算 (covers: S2; depends: T1)
-- [ ] T4: SpinBox + QSettings 持久化 — acceptance: 重启后半音保持；改值立即写入 (covers: S2; depends: T2, T3)
+- [x] T1: `pitch_shift` 纯函数 + 单测 — acceptance: ratio/shift_f0/shift_audio 时长不变、频谱移调可断言 (covers: S2)
+- [x] T2: PitchView 曲线/音名/悬停随半音变化 — acceptance: set_pitch_shift 后 F0 显示与纵轴按比例变化 (covers: S2; depends: T1)
+- [x] T3: 播放变调 + 缓存 — acceptance: 播放听到变调且时长不变，同参数二次播放不重复计算 (covers: S2; depends: T1)
+- [x] T4: SpinBox + QSettings 持久化 — acceptance: 重启后半音保持；改值立即写入 (covers: S2; depends: T2, T3)
