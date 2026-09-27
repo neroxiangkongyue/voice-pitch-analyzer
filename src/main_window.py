@@ -80,6 +80,27 @@ class _LoadWorker(QObject):
         self.finished.emit()
 
 
+
+class _RecordAnalyzeWorker(QObject):
+    """Run pYIN for a mic take off the UI thread."""
+
+    finished = Signal(object)  # (times, f0, confidence)
+    failed = Signal(str)
+
+    def __init__(self, audio: np.ndarray, sr: int):
+        super().__init__()
+        self._audio = audio
+        self._sr = sr
+
+    @Slot()
+    def run(self):
+        try:
+            times, f0, confidence = extract_pitch(self._audio, self._sr)
+            self.finished.emit((times, f0, confidence))
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -108,6 +129,10 @@ class MainWindow(QMainWindow):
         self._current_zoom = 1.0
         self._zoom_steps = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
         self._loop_enabled = False
+        self._rec_analyze_thread: QThread | None = None
+        self._rec_analyze_worker: _RecordAnalyzeWorker | None = None
+        self._rec_anchor = 0.0
+        self._rec_as_overlay = False
         self._settings = QSettings("VoicePitchAnalyzer", "pitch-shift")
         self._pitch_shift_semitones = float(self._settings.value("semitone", 0.0, type=float))
         # Cache of pitch-shifted audio for the active document.
@@ -459,6 +484,65 @@ class MainWindow(QMainWindow):
 
     # ── Recording ─────────────────────────────────────────────────
 
+
+    def _start_record_analysis(self, audio: np.ndarray, sr: int):
+        if self._rec_analyze_thread is not None:
+            self.statusBar().showMessage("正在分析上一段录音，请稍候")
+            return
+        self._rec_anchor = self._record_anchor if self._doc is not None else 0.0
+        self._rec_as_overlay = self._doc is not None
+        self._record_btn.setEnabled(False)
+        self.statusBar().showMessage(f"正在分析录音 ({len(audio) / sr:.2f}s)…")
+
+        thread = QThread(self)
+        worker = _RecordAnalyzeWorker(audio, sr)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_record_analyzed)
+        worker.failed.connect(self._on_record_analyze_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_rec_analyze_refs)
+        self._rec_analyze_thread = thread
+        self._rec_analyze_worker = worker
+        self._pending_rec_audio_len = len(audio) / sr
+        self._pending_rec_audio = audio
+        self._pending_rec_sr = sr
+        thread.start()
+
+    def _clear_rec_analyze_refs(self):
+        self._rec_analyze_thread = None
+        self._rec_analyze_worker = None
+        self._record_btn.setEnabled(True)
+
+    def _on_record_analyzed(self, payload):
+        times, f0, confidence = payload
+        dur = getattr(self, "_pending_rec_audio_len", 0.0)
+        if self._rec_as_overlay and self._doc is not None:
+            times = np.asarray(times, dtype=float) + self._rec_anchor
+            self._pv.add_overlay(times, f0, confidence)
+            self._recording_counter += 1
+            self.statusBar().showMessage(
+                f"录音已叠加 (黄) @ {self._rec_anchor:.2f}s，时长 {dur:.2f}s"
+                f" | 叠加 #{self._recording_counter}"
+            )
+            return
+        fmin, fmax = detect_frequency_range(f0, max(dur, 1e-3))
+        self._recording_counter += 1
+        self._add_document(AudioDocument(
+            title=f"[录音 {self._recording_counter}]",
+            audio=getattr(self, "_pending_rec_audio", np.zeros(0, dtype=np.float32)),
+            sr=getattr(self, "_pending_rec_sr", 16000),
+            times=times, f0=f0, confidence=confidence, fmin=fmin, fmax=fmax,
+        ))
+        self.statusBar().showMessage(f"录音完成: {dur:.2f}s")
+
+    def _on_record_analyze_failed(self, message: str):
+        self._record_btn.setEnabled(True)
+        QMessageBox.critical(self, "分析失败", message)
+
     def _marker_time(self) -> float:
         """Timeline position of the single-click marker / selection start, or 0."""
         if self._pv is None:
@@ -487,31 +571,7 @@ class MainWindow(QMainWindow):
             if len(audio) == 0:
                 self.statusBar().showMessage("录音为空")
                 return
-            try:
-                times, f0, confidence = extract_pitch(audio, sr)
-            except Exception as e:
-                QMessageBox.critical(self, "分析失败", str(e))
-                return
-
-            # With a base clip loaded: draw the take as a yellow overlay at the marker.
-            if self._doc is not None:
-                times = np.asarray(times, dtype=float) + self._record_anchor
-                self._pv.add_overlay(times, f0, confidence)
-                self._recording_counter += 1
-                self.statusBar().showMessage(
-                    f"录音已叠加 (黄) @ {self._record_anchor:.2f}s，时长 {len(audio) / sr:.2f}s"
-                    f" | 叠加 #{self._recording_counter}"
-                )
-                return
-
-            # No base document yet: keep the old standalone-recording behaviour.
-            fmin, fmax = detect_frequency_range(f0, len(audio) / sr)
-            self._recording_counter += 1
-            self._add_document(AudioDocument(
-                title=f"[录音 {self._recording_counter}]", audio=audio, sr=sr,
-                times=times, f0=f0, confidence=confidence, fmin=fmin, fmax=fmax,
-            ))
-            self.statusBar().showMessage(f"录音完成: {len(audio) / sr:.2f}s")
+            self._start_record_analysis(audio, sr)
 
     @Slot()
     def _on_clear_overlays(self):
